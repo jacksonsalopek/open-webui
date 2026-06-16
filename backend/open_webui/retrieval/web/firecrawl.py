@@ -1,14 +1,19 @@
+"""Firecrawl HTTP client used by the web *loader* path.
+
+This fork dropped Firecrawl as a search provider (Kagi-only), but Firecrawl is
+still a selectable web *loader* engine, so :func:`scrape_firecrawl_url` is kept.
+The legacy ``search_firecrawl`` helper has been removed alongside the other
+non-Kagi search providers.
+"""
+
 from __future__ import annotations
 
 import logging
 import time
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import requests
 from langchain_core.documents import Document
-
-if TYPE_CHECKING:
-    from open_webui.retrieval.web.main import SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -175,58 +180,3 @@ def scrape_firecrawl_url(
         document_metadata['description'] = metadata['description']
 
     return Document(page_content=content, metadata=document_metadata)
-
-
-def search_firecrawl(
-    firecrawl_url: str,
-    firecrawl_api_key: str,
-    query: str,
-    count: int,
-    filter_list: list[str] | None = None,
-) -> list[SearchResult]:
-    try:
-        response = request_firecrawl_json(
-            'POST',
-            build_firecrawl_url(firecrawl_url, 'search'),
-            headers=build_firecrawl_headers(firecrawl_api_key),
-            json={
-                'query': query,
-                'limit': count,
-                'timeout': count * 3000,
-                'ignoreInvalidURLs': True,
-            },
-            timeout=count * 3 + 10,
-        )
-        # Firecrawl /search has historically returned both `{"data": [...]}`
-        # (flat list, what v1 did and what frost19k reported under #23966)
-        # and `{"data": {"web": [...]}}` (current v2). Accept either.
-        data = response.get('data') or {}
-        results = data if isinstance(data, list) else (data.get('web') or [])
-
-        if filter_list:
-            from open_webui.retrieval.web.main import get_filtered_results
-
-            results = get_filtered_results(results, filter_list)
-
-        from open_webui.retrieval.web.main import SearchResult
-
-        search_results = []
-        for result in results[:count]:
-            url = get_firecrawl_result_url(result)
-            if not url:
-                continue
-
-            metadata = result.get('metadata') or {}
-            search_results.append(
-                SearchResult(
-                    link=url,
-                    title=result.get('title') or metadata.get('title'),
-                    snippet=result.get('description') or result.get('snippet') or metadata.get('description'),
-                )
-            )
-
-        log.info(f'FireCrawl search results: {search_results}')
-        return search_results
-    except Exception as e:
-        log.error(f'Error in FireCrawl search: {e}')
-        return []

@@ -1368,6 +1368,20 @@ async def get_sources_from_items(
                     else:
                         collection_names.append(item['id'])
 
+        elif item.get('type') == 'web_search':
+            # Web-search results are produced by chat_web_search_handler within
+            # this same request, scoped to the requesting user, with a
+            # collection name derived from a hash of the queries. They are not
+            # client-supplied references to arbitrary stored collections, so
+            # the access-control fallback below would incorrectly drop them.
+            if item.get('collection_name'):
+                collection_names.append(item['collection_name'])
+            elif item.get('docs'):
+                # BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL path
+                query_result = {
+                    'documents': [[doc.get('content') for doc in item.get('docs')]],
+                    'metadatas': [[doc.get('metadata') for doc in item.get('docs')]],
+                }
         elif item.get('docs'):
             # BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL
             query_result = {

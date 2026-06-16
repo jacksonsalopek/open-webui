@@ -25,24 +25,27 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          cache: 'pnpm'
 
       - name: Install dependencies
-        run: npm install --force
+        run: pnpm install --frozen-lockfile
 
       - name: Verify code formatting
-        run: npm run format
+        run: pnpm run format
 
       - name: Verify i18n strings
-        run: npm run i18n:parse
+        run: pnpm run i18n:parse
 
       - name: Ensure working tree is clean
         run: git diff --exit-code
 
       - name: Production build
-        run: npm run build
+        run: pnpm run build
 
   # ── Vitest unit tests ────────────────────────────────────────────────────
   unit-tests:
@@ -52,12 +55,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - uses: pnpm/action-setup@v4
+
       - uses: actions/setup-node@v5
         with:
           node-version: '22'
+          cache: 'pnpm'
 
       - name: Install dependencies (frozen lockfile)
-        run: npm ci --force
+        run: pnpm install --frozen-lockfile
 
       - name: Execute test suite
-        run: npm run test:frontend
+        run: pnpm run test:frontend

@@ -7,7 +7,7 @@
 #
 # How it works:
 #   1. Python: uv pip compile resolves all transitive deps from requirements.txt
-#   2. JavaScript: package-lock.json already contains the full resolved tree
+#   2. JavaScript: pnpm-lock.yaml already contains the full resolved tree
 #   3. Syft scans these resolved files, not the filesystem
 #
 # Usage:
@@ -67,13 +67,13 @@ generate() {
         --quiet \
         > "$WORK_DIR/requirements-resolved.txt" 2>/dev/null
 
-    # --- JavaScript: package-lock.json is already fully resolved ---
-    if [[ -f "$ROOT_DIR/package-lock.json" ]]; then
-        cp "$ROOT_DIR/package-lock.json" "$WORK_DIR/package-lock.json"
+    # --- JavaScript: pnpm-lock.yaml is already fully resolved ---
+    if [[ -f "$ROOT_DIR/pnpm-lock.yaml" ]]; then
+        cp "$ROOT_DIR/pnpm-lock.yaml" "$WORK_DIR/pnpm-lock.yaml"
         # Syft needs package.json alongside the lockfile
         cp "$ROOT_DIR/package.json" "$WORK_DIR/package.json"
     else
-        warn "package-lock.json not found — JS deps will be skipped"
+        warn "pnpm-lock.yaml not found — JS deps will be skipped"
     fi
 
     # --- Scan only the resolved files ---

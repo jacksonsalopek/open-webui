@@ -28,19 +28,22 @@ FROM --platform=$BUILDPLATFORM node:22-alpine3.20 AS build
 ARG BUILD_HASH
 
 # Set Node.js options (heap limit Allocation failed - JavaScript heap out of memory)
-# ENV NODE_OPTIONS="--max-old-space-size=4096"
+# ENV NODE_OPTIONS="--max-old-space-size=8192"
 
 WORKDIR /app
 
 # to store git revision in build
 RUN apk add --no-cache git
 
-COPY package.json package-lock.json ./
-RUN npm ci --force
+# Enable Corepack so pnpm matches the version pinned in package.json (packageManager field)
+RUN corepack enable
+
+COPY package.json pnpm-lock.yaml .npmrc ./
+RUN corepack prepare pnpm@9.6.0 --activate && pnpm install --frozen-lockfile
 
 COPY . .
 ENV APP_BUILD_HASH=${BUILD_HASH}
-RUN npm run build
+RUN pnpm run build
 
 ######## WebUI backend ########
 FROM python:3.11-slim-bookworm AS base

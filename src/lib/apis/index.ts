@@ -159,15 +159,17 @@ export const getModels = async (
 				direct: true
 			}))
 		);
-
-		// Remove duplicates
-		const modelsMap = {};
-		for (const model of models) {
-			modelsMap[model.id] = model;
-		}
-
-		models = Object.values(modelsMap);
 	}
+
+	// Deduplicate by id (last write wins). Handles backends that surface the
+	// same model via multiple connections (e.g. native Ollama + LiteLLM proxy
+	// wrapping the same Ollama instance).
+	const modelsMap: Record<string, any> = {};
+	for (const model of models) {
+		if (!model?.id) continue;
+		modelsMap[model.id] = model;
+	}
+	models = Object.values(modelsMap);
 
 	return models;
 };

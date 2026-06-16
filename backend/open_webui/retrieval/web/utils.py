@@ -208,6 +208,13 @@ def extract_metadata(soup, url):
     return metadata
 
 
+# Bound the pre-flight TLS check. Without a timeout, a single slow / unreachable
+# host (e.g. AAAA record with no IPv6 route, ICMP-blackholed firewall) blocks the
+# threadpool task indefinitely, which in turn hangs SafePlaywrightURLLoader before
+# it ever connects to the browser.
+SSL_VERIFY_TIMEOUT = 5.0
+
+
 def verify_ssl_cert(url: str) -> bool:
     """Verify SSL certificate for the given URL."""
     if not url.startswith('https://'):
@@ -216,13 +223,20 @@ def verify_ssl_cert(url: str) -> bool:
     try:
         hostname = url.split('://')[-1].split('/')[0]
         context = ssl.create_default_context(cafile=certifi.where())
-        with context.wrap_socket(ssl.socket(), server_hostname=hostname) as s:
-            s.connect((hostname, 443))
-        return True
-    except ssl.SSLError:
+        with socket.create_connection((hostname, 443), timeout=SSL_VERIFY_TIMEOUT) as raw_sock:
+            raw_sock.settimeout(SSL_VERIFY_TIMEOUT)
+            with context.wrap_socket(raw_sock, server_hostname=hostname):
+                return True
+    except (socket.timeout, TimeoutError) as e:
+        log.warning(
+            f'SSL verification timed out for {url} after {SSL_VERIFY_TIMEOUT}s: {e}'
+        )
+        return False
+    except ssl.SSLError as e:
+        log.warning(f'SSL verification failed (handshake) for {url}: {e}')
         return False
     except Exception as e:
-        log.warning(f'SSL verification failed for {url}: {str(e)}')
+        log.warning(f'SSL verification failed for {url}: {e}')
         return False
 
 
@@ -572,7 +586,11 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     self._safe_process_url_sync(url)
                     page = browser.new_page()
                     page.route('**/*', self._intercept_navigation_sync)
-                    response = page.goto(url, timeout=self.playwright_timeout)
+                    response = page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until='domcontentloaded',
+                    )
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
@@ -590,6 +608,22 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         """Safely load URLs asynchronously with support for remote browser."""
         from playwright.async_api import async_playwright
 
+        # Connection-level failures from the remote browser ("socket hang up",
+        # closed/disconnected target, etc.) leave the `browser` handle pointing
+        # at a corpse — every subsequent operation queues RPCs against a session
+        # that no longer exists, and the final `browser.close()` /
+        # async_playwright `__aexit__` block forever waiting for them. Detect
+        # those errors and bail out of the loop early.
+        FATAL_BROWSER_ERROR_MARKERS = (
+            'socket hang up',
+            'browser has disconnected',
+            'browser closed',
+            'connection closed',
+            'target closed',
+            'target page, context or browser has been closed',
+            'session with given id not found',
+        )
+
         async with async_playwright() as p:
             # Use remote browser if ws_endpoint is provided, otherwise use local browser
             if self.playwright_ws_url:
@@ -597,12 +631,27 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
             else:
                 browser = await p.chromium.launch(headless=self.headless, proxy=self.proxy)
 
+            browser_alive = True
+
             for url in self.urls:
+                if not browser_alive:
+                    log.warning(
+                        'Skipping %s: remote browser session is dead, no point '
+                        'trying additional URLs in this batch',
+                        url,
+                    )
+                    continue
+
+                page = None
                 try:
                     await self._safe_process_url(url)
                     page = await browser.new_page()
                     await page.route('**/*', self._intercept_navigation)
-                    response = await page.goto(url, timeout=self.playwright_timeout)
+                    response = await page.goto(
+                        url,
+                        timeout=self.playwright_timeout,
+                        wait_until='domcontentloaded',
+                    )
                     if response is None:
                         raise ValueError(f'page.goto() returned None for url {url}')
 
@@ -610,11 +659,32 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
                     metadata = {'source': url}
                     yield Document(page_content=text, metadata=metadata)
                 except Exception as e:
-                    if self.continue_on_failure:
+                    err_msg = str(e).lower()
+                    is_fatal = any(m in err_msg for m in FATAL_BROWSER_ERROR_MARKERS)
+                    if is_fatal:
+                        browser_alive = False
+                        log.error(
+                            'Fatal Playwright connection error while loading %s; '
+                            'aborting remaining URLs in this batch: %s',
+                            url,
+                            e,
+                        )
+                    elif self.continue_on_failure:
                         log.exception(f'Error loading {url}: {e}')
-                        continue
-                    raise e
-            await browser.close()
+                    else:
+                        raise
+                finally:
+                    if page is not None and browser_alive:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+
+            if browser_alive:
+                try:
+                    await browser.close()
+                except Exception as e:
+                    log.warning(f'Browser close failed: {e}')
 
 
 class SafeWebBaseLoader(WebBaseLoader):
