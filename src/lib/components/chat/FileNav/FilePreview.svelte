@@ -108,7 +108,7 @@
 	// For HTML files on system terminals (proxy URL), use path-based serving
 	// so the iframe can resolve relative CSS/JS/image references via cookie auth.
 	$: serveUrl =
-		isHtml && selectedFile && baseUrl && baseUrl.includes('/api/v1/terminals/')
+		isHtml && selectedFile && baseUrl?.includes('/api/v1/terminals/')
 			? `${baseUrl}/files/serve/${selectedFile.replace(/^\//, '')}`
 			: null;
 	$: renderedHtml =
@@ -130,7 +130,7 @@
 
 		for (const codeEl of codeEls) {
 			const pre = codeEl.parentElement;
-			if (!pre || pre.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
+			if (pre?.tagName !== 'PRE' || pre.dataset.mermaidRendered) continue;
 			pre.dataset.mermaidRendered = 'true';
 
 			try {
@@ -220,7 +220,7 @@
 	}
 
 	// ── JSON parsing ────────────────────────────────────────────────────
-	let parsedJson: unknown = undefined;
+	let parsedJson: unknown ;
 	let jsonError: string | null = null;
 
 	$: if (isJson && fileContent !== null) {

@@ -66,11 +66,11 @@
 
 	$: isPDF =
 		item?.meta?.content_type === 'application/pdf' ||
-		(item?.name && item?.name.toLowerCase().endsWith('.pdf'));
+		(item?.name?.toLowerCase().endsWith('.pdf'));
 
 	$: isMarkdown =
 		item?.meta?.content_type === 'text/markdown' ||
-		(item?.name && item?.name.toLowerCase().endsWith('.md'));
+		(item?.name?.toLowerCase().endsWith('.md'));
 
 	$: isCode =
 		item?.name &&
@@ -97,11 +97,11 @@
 
 	$: isAudio =
 		(item?.meta?.content_type ?? '').startsWith('audio/') ||
-		(item?.name && item?.name.toLowerCase().endsWith('.mp3')) ||
-		(item?.name && item?.name.toLowerCase().endsWith('.wav')) ||
-		(item?.name && item?.name.toLowerCase().endsWith('.ogg')) ||
-		(item?.name && item?.name.toLowerCase().endsWith('.m4a')) ||
-		(item?.name && item?.name.toLowerCase().endsWith('.webm'));
+		(item?.name?.toLowerCase().endsWith('.mp3')) ||
+		(item?.name?.toLowerCase().endsWith('.wav')) ||
+		(item?.name?.toLowerCase().endsWith('.ogg')) ||
+		(item?.name?.toLowerCase().endsWith('.m4a')) ||
+		(item?.name?.toLowerCase().endsWith('.webm'));
 
 	$: isImage =
 		(item?.meta?.content_type ?? '').startsWith('image/') ||
@@ -129,12 +129,12 @@
 	$: isDocx =
 		item?.meta?.content_type ===
 			'application/vnd.openxmlformats-officedocument.wordprocessingml.document' ||
-		(item?.name && item.name.toLowerCase().endsWith('.docx'));
+		(item?.name?.toLowerCase().endsWith('.docx'));
 
 	$: isPptx =
 		item?.meta?.content_type ===
 			'application/vnd.openxmlformats-officedocument.presentationml.presentation' ||
-		(item?.name && item.name.toLowerCase().endsWith('.pptx'));
+		(item?.name?.toLowerCase().endsWith('.pptx'));
 
 	const loadExcelContent = async () => {
 		try {

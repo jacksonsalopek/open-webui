@@ -54,7 +54,7 @@
 			`${WEBUI_BASE_URL}/api`
 		);
 
-		if (res && res.ok) {
+		if (res?.ok) {
 			const reader = res.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))

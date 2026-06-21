@@ -327,7 +327,7 @@
 			// Only handle responses for this execution ID
 			if (eventId !== id) return;
 			// Ignore FS responses (they use a type field)
-			if (data.type && data.type.startsWith('fs:')) return;
+			if (data.type?.startsWith('fs:')) return;
 
 			console.log('pyodideWorker.onmessage', event);
 			clearTimeout(timeoutId);

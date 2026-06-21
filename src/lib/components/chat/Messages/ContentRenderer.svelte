@@ -100,7 +100,7 @@
 		const result = [];
 		for (const source of sources ?? []) {
 			for (let index = 0; index < (source.document ?? []).length; index++) {
-				if (model?.info?.meta?.capabilities?.citations == false) {
+				if (model?.info?.meta?.capabilities?.citations === false) {
 					result.push('N/A');
 					continue;
 				}

@@ -158,6 +158,7 @@ all = [
     "pytest~=8.3.2",
     "pytest-docker~=3.2.5",
     "playwright==1.58.0", # Caution: version must match docker-compose.playwright.yaml - Update the docker-compose.yaml if necessary
+    "trafilatura==2.0.0", # Pure-Python web content extractor used by SafeTrafilaturaLoader (WEB_LOADER_ENGINE=trafilatura).
     "elasticsearch==9.3.0",
 
     "qdrant-client==1.17.0",

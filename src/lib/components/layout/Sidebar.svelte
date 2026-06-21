@@ -573,7 +573,7 @@
 				}
 			}),
 			settings.subscribe((value) => {
-				if (pinnedModels != value?.pinnedModels ?? []) {
+				if (pinnedModels !== value?.pinnedModels ?? []) {
 					pinnedModels = value?.pinnedModels ?? [];
 					showPinnedModels = pinnedModels.length > 0;
 				}

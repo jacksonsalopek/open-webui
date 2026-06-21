@@ -352,7 +352,7 @@
 			itemId: uuidv4()
 		};
 
-		if (fileItem.size == 0) {
+		if (fileItem.size === 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
 			return null;
 		}
@@ -1081,7 +1081,7 @@
 				minSize = !largeScreen ? 100 : Math.floor(percentage);
 
 				if (showSidepanel) {
-					if (pane && pane.isExpanded() && pane.getSize() < minSize) {
+					if (pane?.isExpanded() && pane.getSize() < minSize) {
 						pane.resize(minSize);
 					}
 				}

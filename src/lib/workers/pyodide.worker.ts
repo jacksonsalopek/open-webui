@@ -4,11 +4,11 @@ declare global {
 	interface Window {
 		stdout: string | null;
 		stderr: string | null;
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		// biome-ignore lint/suspicious/noExplicitAny: pyodide returns arbitrary Python values
 		result: any;
 		pyodide: PyodideInterface;
 		packages: string[];
-		// eslint-disable-next-line @typescript-eslint/no-explicit-any
+		// biome-ignore lint/suspicious/noExplicitAny: window is augmented with arbitrary pyodide bindings
 		[key: string]: any;
 	}
 }
@@ -153,7 +153,9 @@ function fsDelete(path: string) {
 		const stat = self.pyodide.FS.stat(path);
 		if (self.pyodide.FS.isDir(stat.mode)) {
 			// Recursively delete directory contents
-			const items = self.pyodide.FS.readdir(path).filter((n: string) => n !== '.' && n !== '..');
+			const items = self.pyodide.FS.readdir(path).filter(
+				(n: string) => n !== '.' && n !== '..'
+			);
 			for (const item of items) {
 				fsDelete(`${path}/${item}`);
 			}
@@ -332,7 +334,11 @@ function processResult(result: any): any {
 			// Handle null and undefined
 			return null;
 		}
-		if (typeof result === 'string' || typeof result === 'number' || typeof result === 'boolean') {
+		if (
+			typeof result === 'string' ||
+			typeof result === 'number' ||
+			typeof result === 'boolean'
+		) {
 			// Handle primitive types directly
 			return result;
 		}

@@ -12,7 +12,7 @@
 	});
 
 	onDestroy(() => {
-		if (popupElement && popupElement.parentNode) {
+		if (popupElement?.parentNode) {
 			try {
 				popupElement.parentNode.removeChild(popupElement);
 			} catch (err) {

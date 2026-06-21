@@ -128,7 +128,7 @@
 
 	$: isActive =
 		(taskIds && taskIds.length > 0) ||
-		(history.currentId && history.messages[history.currentId]?.done != true) ||
+		(history.currentId && history.messages[history.currentId]?.done !== true) ||
 		generating;
 
 	export let prompt = '';
@@ -509,7 +509,7 @@
 
 	let toggleFilters = [];
 	$: toggleFilters = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
-		.map((id) => ($models.find((model) => model.id === id) || {})?.filters ?? [])
+		.map((id) => $models.find((model) => model.id === id)?.filters ?? [])
 		.reduce((acc, filters) => acc.filter((f1) => filters.some((f2) => f2.id === f1.id)));
 
 	let showToolsButton = false;
@@ -622,7 +622,7 @@
 			...itemData
 		};
 
-		if (fileItem.size == 0) {
+		if (fileItem.size === 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
 			return null;
 		}

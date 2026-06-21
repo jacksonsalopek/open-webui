@@ -4,6 +4,7 @@ import threading
 from contextlib import contextmanager
 from typing import Optional
 from datetime import datetime, timedelta
+from urllib.parse import urlparse
 
 import requests
 import urllib3.util.connection as urllib3_connection
@@ -50,7 +51,15 @@ def _build_session() -> requests.Session:
 
 _session = _build_session()
 
-RECENCY_KEYWORDS = ("latest", "news")
+RECENCY_KEYWORDS = ("latest", "recent", "today", "this week")
+# Lexical signals that the user wants journalistic / current-events coverage.
+# Triggers merging Kagi's `news` bucket into the result set even when the
+# structured NL filter didn't supply an `after` date.
+NEWS_KEYWORDS = (
+    "news",
+    "headlines",
+    "current events",
+)
 BREAKING_KEYWORDS = (
     "breaking",
     "breaking news",
@@ -68,6 +77,58 @@ BREAKING_KEYWORDS = (
 BREAKING_WINDOW_DAYS = 2
 RECENCY_WINDOW_DAYS = 30
 
+# Bare registrable domains we treat as "social media". Subdomains match too
+# (e.g. "old.reddit.com" hits "reddit.com") via the suffix check in
+# ``_is_social_media``. Kept conservative on purpose — sites like youtube.com,
+# medium.com, and quora.com host enough primary-source content that capping
+# them as "social" is more likely to hurt than help for news-style queries.
+SOCIAL_MEDIA_DOMAINS = frozenset(
+    {
+        'twitter.com',
+        'x.com',
+        'facebook.com',
+        'instagram.com',
+        'tiktok.com',
+        'reddit.com',
+        'linkedin.com',
+        'threads.net',
+        'bsky.app',
+        'mastodon.social',
+        'pinterest.com',
+        'snapchat.com',
+        'tumblr.com',
+    }
+)
+# Hard cap on how many social-media results we let through per query. Social
+# results are useful for color/eyewitness context but easily crowd out higher-
+# signal news/primary sources, so we keep at most this many and preserve the
+# ranker's ordering otherwise.
+SOCIAL_MEDIA_RESULT_CAP = 3
+
+
+def _is_social_media(url: str) -> bool:
+    domain = urlparse(url).netloc.lower()
+    if domain.startswith('www.'):
+        domain = domain[4:]
+    return any(
+        domain == d or domain.endswith('.' + d) for d in SOCIAL_MEDIA_DOMAINS
+    )
+
+
+def _cap_social_media(
+    results: list[SearchResult], *, max_count: int
+) -> list[SearchResult]:
+    """Drop social-media results past ``max_count``, preserving order."""
+    capped: list[SearchResult] = []
+    kept_social = 0
+    for result in results:
+        if _is_social_media(result.link):
+            if kept_social >= max_count:
+                continue
+            kept_social += 1
+        capped.append(result)
+    return capped
+
 
 def search_kagi(
     api_key: str,
@@ -75,6 +136,7 @@ def search_kagi(
     count: int,
     filter_list: Optional[list[str]] = None,
     search_filter: Optional[WebSearchFilter] = None,
+    lens_id: Optional[str] = None,
 ) -> list[SearchResult]:
     """Search using Kagi's Search API and return the results as a list of SearchResult objects.
 
@@ -90,16 +152,31 @@ def search_kagi(
       news for source variety and skip the domain ``filter_list`` so fresh results
       aren't dropped.
 
+    Lens routing:
+    - When ``lens_id`` is supplied (typically by the upstream lens router from
+      a bang prefix or keyword match), the request uses Kagi's ``lens_id``
+      parameter to scope to that saved/built-in lens. This is mutually
+      exclusive with the inline ``lens`` object built from the NL filter's
+      domain/keyword constraints — saved lenses already encode those
+      preferences, and Kagi rejects requests that set both at once.
+
     Args:
         api_key (str): A Kagi Search API key
         query (str): The query to search for
         count (int): The number of results to return
         filter_list (list[str] | None): Domain allow-list
         search_filter (WebSearchFilter | None): Parsed natural-language filter
+        lens_id (str | None): A Kagi lens identifier (built-in name or shareable
+            URL slug from kagi.com/settings/lenses) to scope this search.
     """
     query_lower = query.lower()
     is_breaking_query = any(keyword in query_lower for keyword in BREAKING_KEYWORDS)
-    is_recency_query = is_breaking_query or any(keyword in query_lower for keyword in RECENCY_KEYWORDS)
+    is_news_query = any(keyword in query_lower for keyword in NEWS_KEYWORDS)
+    # "news" implies recency; "latest"/"today" do too. Either triggers an
+    # `after` date when the structured filter didn't supply one.
+    is_recency_query = is_breaking_query or is_news_query or any(
+        keyword in query_lower for keyword in RECENCY_KEYWORDS
+    )
 
     url = 'https://kagi.com/api/v1/search'
     headers = {
@@ -135,17 +212,27 @@ def search_kagi(
         if 'lens' in provider_params:
             payload['lens'] = provider_params['lens']
 
+    # A routed saved/built-in lens supersedes the inline lens object built
+    # from the NL filter — Kagi treats ``lens`` and ``lens_id`` as mutually
+    # exclusive, and the saved lens already encodes its own
+    # site / keyword preferences.
+    if lens_id:
+        payload['lens_id'] = lens_id
+        if 'lens' in payload:
+            del payload['lens']
+
     payload['filters'] = filters
 
     log.debug(
         "Kagi search request: url=%s query=%r count=%s is_breaking=%s is_recency=%s "
-        "has_filter=%s payload=%s",
+        "has_filter=%s lens_id=%s payload=%s",
         url,
         query,
         count,
         is_breaking_query,
         is_recency_query,
         search_filter is not None,
+        lens_id,
         payload,
     )
 
@@ -186,9 +273,16 @@ def search_kagi(
         if api_errors:
             log.warning("Kagi search returned API errors: %s", api_errors)
 
-    # Recency-oriented requests pull from both buckets for a variety of sources.
-    wants_variety = is_recency_query or (search_filter is not None and search_filter.after is not None)
-    if wants_variety:
+    # Merge Kagi's `news` bucket whenever any layer signals news/recency intent:
+    # an explicit news-y keyword in the query, a generic recency keyword, or a
+    # structured `after` filter from the NL parser. This keeps "Hungary news"
+    # rich even if the LLM filter call failed and only the heuristic ran.
+    wants_news_bucket = (
+        is_news_query
+        or is_recency_query
+        or (search_filter is not None and search_filter.after is not None)
+    )
+    if wants_news_bucket:
         search_results = data.get('search', []) + data.get('news', [])
     else:
         search_results = data.get('search', [])
@@ -202,6 +296,18 @@ def search_kagi(
     # Skip the domain filter_list for recency queries so fresh results aren't dropped.
     if filter_list and not is_recency_query:
         results = get_filtered_results(results, filter_list)
+
+    # Cap social-media noise before the final count slice so we don't waste
+    # the user's budget on tweets when there are real articles further down.
+    pre_cap = len(results)
+    results = _cap_social_media(results, max_count=SOCIAL_MEDIA_RESULT_CAP)
+    if len(results) != pre_cap:
+        log.debug(
+            "Kagi search: capped social-media results from %d to %d (cap=%d)",
+            pre_cap,
+            len(results),
+            SOCIAL_MEDIA_RESULT_CAP,
+        )
 
     # Kagi's API ignores `extract.count` as a hard cap and returns the full result
     # page (and for recency queries we merge `search` + `news`), so enforce the

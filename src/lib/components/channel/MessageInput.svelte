@@ -451,7 +451,7 @@
 			itemId: tempItemId
 		};
 
-		if (fileItem.size == 0) {
+		if (fileItem.size === 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
 			return null;
 		}

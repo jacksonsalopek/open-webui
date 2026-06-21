@@ -110,7 +110,7 @@
 	const normalizeRMS = (rms) => {
 		rms = rms * 10;
 		const exp = 1.5; // Adjust exponent value; values greater than 1 expand larger numbers more and compress smaller numbers more
-		const scaledRMS = Math.pow(rms, exp);
+		const scaledRMS = rms ** exp;
 
 		// Scale between 0.01 (1%) and 1.0 (100%)
 		return Math.min(1.0, Math.max(0.01, scaledRMS));
@@ -335,7 +335,7 @@
 					};
 
 					// Event triggered when recognition is ended
-					speechRecognition.onend = function () {
+					speechRecognition.onend = () => {
 						// Restart recognition after it ends
 						console.log('recognition ended');
 
@@ -348,7 +348,7 @@
 					};
 
 					// Event triggered when an error occurs
-					speechRecognition.onerror = function (event) {
+					speechRecognition.onerror = (event) => {
 						console.log(event);
 						toast.error($i18n.t(`Speech recognition error: {{error}}`, { error: event.error }));
 						onCancel();

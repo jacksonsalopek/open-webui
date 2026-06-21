@@ -46,7 +46,9 @@ function generateRegexRules(delimiters) {
 			inlinePatterns.push(`${escapedLeft}((?:\\\\[^]|[^\\\\])+?)${escapedRight}`);
 		} else {
 			// Block delimiters doubles as inline delimiters when not followed by a newline
-			inlinePatterns.push(`${escapedLeft}(?!\\n)((?:\\\\[^]|[^\\\\])+?)(?!\\n)${escapedRight}`);
+			inlinePatterns.push(
+				`${escapedLeft}(?!\\n)((?:\\\\[^]|[^\\\\])+?)(?!\\n)${escapedRight}`
+			);
 			blockPatterns.push(`${escapedLeft}\\n((?:\\\\[^]|[^\\\\])+?)\\n${escapedRight}`);
 		}
 	});
@@ -139,7 +141,7 @@ function katexStart(src, displayMode: boolean) {
 	}
 }
 
-function katexTokenizer(src, tokens, displayMode: boolean) {
+function katexTokenizer(src, _tokens, displayMode: boolean) {
 	if (src.startsWith('$$')) {
 		const displayToken = tokenizeDisplayMath(
 			src,
@@ -171,7 +173,7 @@ function katexTokenizer(src, tokens, displayMode: boolean) {
 	}
 }
 
-function inlineKatex(options) {
+function inlineKatex(_options) {
 	return {
 		name: 'inlineKatex',
 		level: 'inline',
@@ -187,7 +189,7 @@ function inlineKatex(options) {
 	};
 }
 
-function blockKatex(options) {
+function blockKatex(_options) {
 	return {
 		name: 'blockKatex',
 		level: 'block',

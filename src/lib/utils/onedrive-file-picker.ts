@@ -260,7 +260,9 @@ async function downloadOneDriveFile(
 	});
 
 	if (!response.ok) {
-		throw new Error(`Failed to fetch file information: ${response.status} ${response.statusText}`);
+		throw new Error(
+			`Failed to fetch file information: ${response.status} ${response.statusText}`
+		);
 	}
 
 	const fileData = await response.json();
@@ -302,7 +304,10 @@ export async function openOneDrivePicker(
 		const handleWindowMessage = (event: MessageEvent) => {
 			if (event.source !== pickerWindow) return;
 			const message = event.data;
-			if (message?.type === 'initialize' && message?.channelId === params.messaging.channelId) {
+			if (
+				message?.type === 'initialize' &&
+				message?.channelId === params.messaging.channelId
+			) {
 				channelPort = event.ports?.[0];
 				if (!channelPort) return;
 				channelPort.addEventListener('message', handlePortMessage);
@@ -324,7 +329,9 @@ export async function openOneDrivePicker(
 							try {
 								// Pass the resource from the command for org accounts
 								const resource =
-									config.getAuthorityType() === 'organizations' ? command.resource : undefined;
+									config.getAuthorityType() === 'organizations'
+										? command.resource
+										: undefined;
 								const newToken = await getToken(resource, authorityType);
 								if (newToken) {
 									channelPort?.postMessage({
@@ -341,7 +348,10 @@ export async function openOneDrivePicker(
 									id: portData.id,
 									data: {
 										result: 'error',
-										error: { code: 'tokenError', message: 'Failed to get token' }
+										error: {
+											code: 'tokenError',
+											message: 'Failed to get token'
+										}
 									}
 								});
 							}
@@ -441,7 +451,7 @@ export async function pickAndDownloadFile(
 ): Promise<{ blob: Blob; name: string } | null> {
 	const pickerResult = await openOneDrivePicker(authorityType);
 
-	if (!pickerResult || !pickerResult.items || pickerResult.items.length === 0) {
+	if (!pickerResult?.items || pickerResult.items.length === 0) {
 		return null;
 	}
 

@@ -55,7 +55,9 @@ const parsePngText = (arrayBuffer) => {
 	}
 
 	try {
-		return new TextDecoder().decode(Uint8Array.from(atob(textChunk.text), (c) => c.charCodeAt(0)));
+		return new TextDecoder().decode(
+			Uint8Array.from(atob(textChunk.text), (c) => c.charCodeAt(0))
+		);
 	} catch (e) {
 		throw new Error('Unable to parse "chara" field as base64', e);
 	}
@@ -79,7 +81,10 @@ const readPngChunks = (data) => {
 
 	while (offset < data.length) {
 		const length =
-			(data[offset] << 24) | (data[offset + 1] << 16) | (data[offset + 2] << 8) | data[offset + 3];
+			(data[offset] << 24) |
+			(data[offset + 1] << 16) |
+			(data[offset + 2] << 8) |
+			data[offset + 3];
 		const type = String.fromCharCode.apply(null, data.slice(offset + 4, offset + 8));
 		const chunkData = data.slice(offset + 8, offset + 8 + length);
 		const crc =
@@ -129,7 +134,7 @@ const extractCharacter = (json) => {
 						break;
 					}
 				}
-				return value && value.trim();
+				return value?.trim();
 			})
 			.find((value) => value);
 	}
@@ -175,8 +180,7 @@ const detectFormats = (json) => {
 	)
 		formats.push('TavernAI Character');
 	if (
-		json.character &&
-		json.character.name &&
+		json.character?.name &&
 		json.character.title &&
 		json.character.description &&
 		json.character.greeting &&
@@ -184,9 +188,7 @@ const detectFormats = (json) => {
 	)
 		formats.push('CharacterAI Character');
 	if (
-		json.info &&
-		json.info.character &&
-		json.info.character.name &&
+		json.info?.character?.name &&
 		json.info.character.title &&
 		json.info.character.description &&
 		json.info.character.greeting

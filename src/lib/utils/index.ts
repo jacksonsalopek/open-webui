@@ -48,7 +48,9 @@ export const replaceOutsideCode = (content: string, replacer: (str: string) => s
 	return content
 		.split(/(```[\s\S]*?```|`[\s\S]*?`)/)
 		.map((segment) => {
-			return segment.startsWith('```') || segment.startsWith('`') ? segment : replacer(segment);
+			return segment.startsWith('```') || segment.startsWith('`')
+				? segment
+				: replacer(segment);
 		})
 		.join('');
 };
@@ -159,7 +161,10 @@ function processChineseDelimiters(
 	);
 	return line.replace(regex, (match, l, left, content, right, r) => {
 		const result =
-			(content.startsWith(leftSymbol) && l && l.length > 0 && isChineseChar(l[l.length - 1])) ||
+			(content.startsWith(leftSymbol) &&
+				l &&
+				l.length > 0 &&
+				isChineseChar(l[l.length - 1])) ||
 			(content.endsWith(rightSymbol) && r && r.length > 0 && isChineseChar(r[0]));
 
 		if (result) {
@@ -496,7 +501,7 @@ export const copyToClipboard = async (text, html = null, formatted = false) => {
 		if (!html) {
 			const options = {
 				throwOnError: false,
-				highlight: function (code, lang) {
+				highlight: (code, lang) => {
 					const language = hljs.getLanguage(lang) ? lang : 'plaintext';
 					return hljs.highlight(code, { language }).value;
 				}
@@ -811,9 +816,9 @@ const convertOpenAIMessages = (convo) => {
 		currentId = message_id;
 		try {
 			if (
-				messages.length == 0 &&
+				messages.length === 0 &&
 				(message['message'] == null ||
-					(message['message']['content']['parts']?.[0] == '' &&
+					(message['message']['content']['parts']?.[0] === '' &&
 						message['message']['content']['text'] == null))
 			) {
 				// Skip chat messages with no content
@@ -1049,8 +1054,10 @@ export const processDetails = (content) => {
 				resultText = unescapeHtml(attributes.result);
 			} else {
 				// Extract body content (strip <summary>...</summary>)
-				const bodyMatch = match.match(/<summary>[\s\S]*?<\/summary>\s*([\s\S]*?)\s*<\/details>/i);
-				if (bodyMatch && bodyMatch[1].trim()) {
+				const bodyMatch = match.match(
+					/<summary>[\s\S]*?<\/summary>\s*([\s\S]*?)\s*<\/details>/i
+				);
+				if (bodyMatch?.[1].trim()) {
 					resultText = unescapeHtml(bodyMatch[1].trim());
 				}
 			}
@@ -1499,11 +1506,11 @@ export const convertOpenApiToToolPayload = (openApiSpec) => {
 	const toolPayload = [];
 
 	// Guard against invalid or non-OpenAPI specs (e.g., MCP-style configs)
-	if (!openApiSpec || !openApiSpec.paths) {
+	if (!openApiSpec?.paths) {
 		return toolPayload;
 	}
 
-	for (const [path, methods] of Object.entries(openApiSpec.paths)) {
+	for (const [_path, methods] of Object.entries(openApiSpec.paths)) {
 		if (!methods || typeof methods !== 'object') continue;
 
 		// Path-level parameters apply to all operations under this path
@@ -1565,9 +1572,12 @@ export const convertOpenApiToToolPayload = (openApiSpec) => {
 				// Extract and recursively resolve requestBody if available
 				if ((operation as any).requestBody) {
 					const content = (operation as any).requestBody.content;
-					if (content && content['application/json']) {
+					if (content?.['application/json']) {
 						const requestSchema = content['application/json'].schema;
-						const resolvedRequestSchema = resolveSchema(requestSchema, openApiSpec.components);
+						const resolvedRequestSchema = resolveSchema(
+							requestSchema,
+							openApiSpec.components
+						);
 
 						if (resolvedRequestSchema.properties) {
 							tool.parameters.properties = {
@@ -1577,7 +1587,10 @@ export const convertOpenApiToToolPayload = (openApiSpec) => {
 
 							if (resolvedRequestSchema.required) {
 								tool.parameters.required = [
-									...new Set([...tool.parameters.required, ...resolvedRequestSchema.required])
+									...new Set([
+										...tool.parameters.required,
+										...resolvedRequestSchema.required
+									])
 								];
 							}
 						} else if (resolvedRequestSchema.type === 'array') {
@@ -1885,7 +1898,7 @@ export const extractContentFromFile = async (file: File) => {
 	// Fallback: try to read as text, if decodable
 	try {
 		return await readAsText(file);
-	} catch (err) {
+	} catch (_err) {
 		throw new Error('Unsupported or non-text file type: ' + (file.name || type));
 	}
 };
@@ -1917,7 +1930,7 @@ export const convertHeicToJpeg = async (file: File) => {
 export const decodeString = (str: string) => {
 	try {
 		return decodeURIComponent(str);
-	} catch (e) {
+	} catch (_e) {
 		return str;
 	}
 };
@@ -1999,11 +2012,11 @@ export const renderMermaidDiagram = async (
 	}
 };
 
-export const renderVegaVisualization = async (spec: string, i18n?: any) => {
+export const renderVegaVisualization = async (spec: string, _i18n?: any) => {
 	const vega = await import('vega');
 	const parsedSpec = JSON.parse(spec);
 	let vegaSpec = parsedSpec;
-	if (parsedSpec.$schema && parsedSpec.$schema.includes('vega-lite')) {
+	if (parsedSpec.$schema?.includes('vega-lite')) {
 		const vegaLite = await import('vega-lite');
 		vegaSpec = vegaLite.compile(parsedSpec).spec;
 	}
@@ -2019,14 +2032,14 @@ export const getCodeBlockContents = (content: string): object => {
 
 	const codeBlockContents = content.match(/```[\s\S]*?```/g);
 
-	let codeBlocks = [];
+	const codeBlocks = [];
 
 	// Groups of related HTML/CSS/JS blocks. Each HTML block starts a new group;
 	// CSS and JS blocks attach to the current (most recent) group.
 	// This preserves the existing behaviour for "dumb" models that output
 	// separate html/css/js blocks meant to form a single page, while also
 	// allowing multiple distinct HTML blocks to produce separate artifacts.
-	let htmlGroups: Array<{ html: string; css: string; js: string }> = [];
+	const htmlGroups: Array<{ html: string; css: string; js: string }> = [];
 
 	const initDefaultGroup = () => {
 		if (htmlGroups.length === 0) {

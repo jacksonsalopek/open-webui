@@ -1,5 +1,5 @@
 <script lang="ts">
-	// @ts-ignore
+	// @ts-expect-error
 	import fileSaver from 'file-saver';
 	import type { Writable } from 'svelte/store';
 	const { saveAs } = fileSaver;

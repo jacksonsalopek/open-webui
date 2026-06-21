@@ -1,4 +1,3 @@
-import { mount, unmount } from 'svelte';
 import { createClassComponent } from 'svelte/legacy';
 
 import tippy from 'tippy.js';
@@ -100,7 +99,7 @@ export function getSuggestionRenderer(Component: any, ComponentProps = {}) {
 			onKeyDown: (props: any) => {
 				// forward to the Svelte component’s handler
 				// (expose this from component as `export function onKeyDown(evt)`)
-				// @ts-ignore
+				// @ts-expect-error
 				return component?._onKeyDown?.(props.event) ?? false;
 			},
 

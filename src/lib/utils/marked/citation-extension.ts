@@ -37,7 +37,7 @@ export function citationExtension() {
 					const match = /^(\d+)(?:#(.+))?$/.exec(part);
 					if (match) {
 						const index = parseInt(match[1], 10);
-						if (!isNaN(index)) {
+						if (!Number.isNaN(index)) {
 							ids.push(index);
 							// Store the full identifier ("1#foo" or "1")
 							citationIdentifiers.push(part);

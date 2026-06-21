@@ -136,7 +136,7 @@
 		await tick();
 		const textareaElement = document.getElementById(`assistant-${messages.length - 1}-textarea`);
 
-		if (res && res.ok) {
+		if (res?.ok) {
 			const reader = res.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))
@@ -164,7 +164,7 @@
 								let data = JSON.parse(line.replace(/^data: /, ''));
 								console.log(data);
 
-								if (responseMessage.content == '' && data.choices[0].delta.content == '\n') {
+								if (responseMessage.content === '' && data.choices[0].delta.content === '\n') {
 									continue;
 								} else {
 									textareaElement.style.height = textareaElement.scrollHeight + 'px';

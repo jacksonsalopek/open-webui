@@ -26,13 +26,16 @@ from open_webui.config import (
     DEFAULT_CODE_INTERPRETER_PROMPT,
     DEFAULT_TOOLS_FUNCTION_CALLING_PROMPT_TEMPLATE,
     DEFAULT_VOICE_MODE_PROMPT_TEMPLATE,
+    RAG_EMBEDDING_QUERY_PREFIX,
 )
 from open_webui.constants import TASKS
 from open_webui.env import (
     BYPASS_MODEL_ACCESS_CONTROL,
     CHAT_RESPONSE_MAX_TOOL_CALL_ITERATIONS,
     CHAT_RESPONSE_STREAM_DELTA_CHUNK_SIZE,
+    DEFAULT_DATETIME_SYSTEM_PROMPT,
     ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION,
+    ENABLE_DEFAULT_DATETIME_SYSTEM_PROMPT,
     ENABLE_QUERIES_CACHE,
     ENABLE_REALTIME_CHAT_SAVE,
     ENABLE_RESPONSES_API_STATEFUL,
@@ -52,10 +55,16 @@ from open_webui.routers.images import (
     image_edits,
     image_generations,
 )
+from open_webui.models.memories import Memories
+from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.routers.memories import QueryMemoryForm, query_memory
 from open_webui.routers.pipelines import (
     process_pipeline_inlet_filter,
     process_pipeline_outlet_filter,
+)
+from open_webui.retrieval.web.nl_filter import (
+    is_pure_datetime_query,
+    synthesize_datetime_answer,
 )
 from open_webui.routers.retrieval import (
     SearchForm,
@@ -65,6 +74,7 @@ from open_webui.routers.tasks import (
     generate_chat_tags,
     generate_follow_ups,
     generate_image_prompt,
+    generate_memory_extraction,
     generate_queries,
     generate_title,
 )
@@ -147,6 +157,45 @@ DEFAULT_REASONING_TAGS = [
 ]
 DEFAULT_SOLUTION_TAGS = [('<|begin_of_solution|>', '<|end_of_solution|>')]
 DEFAULT_CODE_INTERPRETER_TAGS = [('<code_interpreter>', '</code_interpreter>')]
+
+# Cohere Command A+ grounded-generation wrappers. When the model is given
+# retrieval context it emits structured spans like
+#   <|START_TEXT|>...prose...<|END_TEXT|><|START_CITATION|>doc_id<|END_CITATION|>
+# as ordinary text (not real special tokens, so skip_special_tokens has no
+# effect). vLLM's `cohere_command4` reasoning parser only handles
+# <|START_THINKING|>...<|END_THINKING|>, leaving these visible in the
+# rendered content. We strip them here so the user sees clean prose; the
+# structured 'sources' array populated by the RAG pipeline carries the
+# citation linkage separately, so we are not losing user-visible info by
+# dropping the wrappers.
+_COHERE_GROUNDED_COMPLETE_RE = re.compile(
+    r'<\|START_CITATION\|>[\s\S]*?<\|END_CITATION\|>'
+    r'|<\|START_ACTION\|>[\s\S]*?<\|END_ACTION\|>'
+    r'|<\|START_TOOL_RESULT\|>[\s\S]*?<\|END_TOOL_RESULT\|>'
+    r'|<\|START_TEXT\|>|<\|END_TEXT\|>'
+)
+# Streaming chunks can split a wrapper across boundaries. Any trailing
+# `<|` followed by zero or more uppercase-or-underscore chars (but no
+# closing `|>`) is potentially the start of a wrapper -- hold it back for
+# the next chunk so we can complete the match.
+_COHERE_GROUNDED_PARTIAL_TAIL_RE = re.compile(r'<\|[A-Z_]*\Z')
+
+
+def strip_cohere_grounded_wrappers(text: str) -> tuple[str, str]:
+    """Strip Cohere grounded-generation wrappers from a streamed text chunk.
+
+    Returns ``(safe_to_emit, hold_for_next_chunk)``. Re-feed the held tail
+    as the prefix of the next chunk to handle wrapper splits at chunk
+    boundaries. For a one-shot (non-streaming) strip, ignore the second
+    element or simply pass an empty hold buffer at the end of the stream
+    to flush it back into the output."""
+    if not text:
+        return '', ''
+    cleaned = _COHERE_GROUNDED_COMPLETE_RE.sub('', text)
+    match = _COHERE_GROUNDED_PARTIAL_TAIL_RE.search(cleaned)
+    if match:
+        return cleaned[: match.start()], cleaned[match.start() :]
+    return cleaned, ''
 
 
 def output_id(prefix: str) -> str:
@@ -461,7 +510,12 @@ def serialize_output(output: list) -> str:
                 if 'text' in content_part:
                     text = content_part.get('text', '').strip()
                     if text:
-                        parts.append(text)
+                        # Defense in depth: even if a wrapper slipped past
+                        # the streaming strip (non-streaming path, replayed
+                        # legacy message, etc.) keep the rendered HTML clean.
+                        text = _COHERE_GROUNDED_COMPLETE_RE.sub('', text)
+                        if text:
+                            parts.append(text)
 
         elif item_type == 'function_call':
             call_id = item.get('call_id', '')
@@ -1491,6 +1545,232 @@ async def chat_memory_handler(request: Request, form_data: dict, extra_params: d
     return form_data
 
 
+async def chat_memory_extract_handler(ctx: dict) -> None:
+    """Background task: distill durable user facts from the just-finished turn
+    and persist them as memories.
+
+    Runs from ``background_tasks_handler`` after the assistant response is
+    fully streamed, so it never blocks the user-visible reply. Gated on:
+
+    - ``ENABLE_MEMORIES`` (global)
+    - ``ENABLE_AUTO_MEMORY_EXTRACTION`` (global, opt-in)
+    - ``features.memories`` permission for the user
+    - chat is not a temp/local/channel chat (need a real chat_id to anchor against)
+    - last user message is at least ``AUTO_MEMORY_EXTRACTION_MIN_USER_CHARS`` long
+
+    Pipeline:
+
+    1. Build a turn-level message list (last user + last assistant).
+    2. Ask the configured task model for a strict JSON list of facts, passing
+       the user's existing memories as duplicate-suppression context.
+    3. For each candidate fact, embed it and search the user's memory vector
+       collection. If similarity to any existing memory exceeds
+       ``AUTO_MEMORY_EXTRACTION_DEDUP_THRESHOLD``, skip; otherwise write to
+       Postgres + upsert the embedding.
+    4. Emit a ``chat:memory:added`` event per persisted memory so the UI can
+       optionally surface a toast (best-effort; safe to ignore client-side).
+
+    All errors are swallowed and logged — auto-memory must never break a chat.
+    """
+    request: Request = ctx['request']
+    user = ctx['user']
+    metadata = ctx['metadata']
+    messages = ctx.get('messages') or []
+    message = ctx.get('message')
+    event_emitter = ctx.get('event_emitter')
+
+    chat_id = metadata.get('chat_id', '') or ''
+    if not chat_id or chat_id.startswith('local:') or chat_id.startswith('channel:'):
+        # Auto-memory is anchored to a persisted chat; skip ephemeral threads.
+        return
+
+    if not getattr(request.app.state.config, 'ENABLE_MEMORIES', False):
+        return
+    if not getattr(request.app.state.config, 'ENABLE_AUTO_MEMORY_EXTRACTION', False):
+        return
+
+    try:
+        if not await has_permission(
+            user.id, 'features.memories', request.app.state.config.USER_PERMISSIONS
+        ):
+            return
+    except Exception as e:
+        log.debug(f'auto-memory permission check failed: {e}')
+        return
+
+    user_message = get_last_user_message(messages) or ''
+    min_chars = getattr(
+        request.app.state.config, 'AUTO_MEMORY_EXTRACTION_MIN_USER_CHARS', 20
+    )
+    if len(user_message.strip()) < min_chars:
+        return
+
+    if not (message and message.get('model')):
+        return
+
+    # Build a 2-message turn (user prompt + assistant reply) for the extractor.
+    last_assistant = None
+    for m in reversed(messages):
+        if m.get('role') == 'assistant':
+            last_assistant = m
+            break
+
+    turn_messages = []
+    for m in reversed(messages):
+        if m.get('role') == 'user':
+            turn_messages.append({'role': 'user', 'content': m.get('content', '')})
+            break
+    if last_assistant:
+        turn_messages.append(
+            {'role': 'assistant', 'content': last_assistant.get('content', '')}
+        )
+    if not turn_messages:
+        return
+
+    try:
+        existing = await Memories.get_memories_by_user_id(user.id)
+    except Exception as e:
+        log.debug(f'auto-memory: failed to load existing memories: {e}')
+        existing = []
+    existing_contents = [m.content for m in (existing or []) if m.content]
+
+    try:
+        res = await generate_memory_extraction(
+            request,
+            {
+                'model': message['model'],
+                'messages': turn_messages,
+                'existing_memories': existing_contents,
+                'chat_id': chat_id,
+            },
+            user,
+        )
+    except Exception as e:
+        log.debug(f'auto-memory: extraction LLM call failed: {e}')
+        return
+
+    if not res or not isinstance(res, dict):
+        return
+    choices = res.get('choices') or []
+    if len(choices) != 1:
+        return
+
+    response_message = choices[0].get('message', {}) or {}
+    raw = response_message.get('content') or response_message.get('reasoning_content') or ''
+    raw = raw[raw.find('{') : raw.rfind('}') + 1] if '{' in raw and '}' in raw else ''
+    if not raw:
+        return
+
+    try:
+        parsed = json.loads(raw)
+    except Exception as e:
+        log.debug(f'auto-memory: JSON parse failed for extractor output: {e}')
+        return
+
+    candidates = parsed.get('memories') or []
+    if not isinstance(candidates, list) or not candidates:
+        return
+
+    # Normalise + de-dup within the candidate list itself before going to the DB.
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for c in candidates:
+        if not isinstance(c, str):
+            continue
+        c = c.strip()
+        if not c or c.lower() in seen:
+            continue
+        seen.add(c.lower())
+        cleaned.append(c)
+    if not cleaned:
+        return
+
+    dedup_threshold = float(
+        getattr(request.app.state.config, 'AUTO_MEMORY_EXTRACTION_DEDUP_THRESHOLD', 0.85)
+    )
+
+    persisted: list[dict] = []
+    for content in cleaned:
+        try:
+            vector = await request.app.state.EMBEDDING_FUNCTION(
+                content,
+                RAG_EMBEDDING_QUERY_PREFIX,
+                user=user,
+            )
+        except Exception as e:
+            log.debug(f'auto-memory: embedding failed for candidate {content!r}: {e}')
+            continue
+
+        # Vector dedup against the user's existing memories. We only do this
+        # when the user already has memories — the very first one bypasses
+        # the search (and the collection might not exist yet).
+        if existing_contents and dedup_threshold > 0.0:
+            try:
+                results = await ASYNC_VECTOR_DB_CLIENT.search(
+                    collection_name=f'user-memory-{user.id}',
+                    vectors=[vector],
+                    limit=1,
+                )
+                top = None
+                if (
+                    results
+                    and getattr(results, 'distances', None)
+                    and results.distances
+                    and results.distances[0]
+                ):
+                    top = results.distances[0][0]
+                if top is not None and top >= dedup_threshold:
+                    log.debug(
+                        f'auto-memory: skipping near-duplicate (sim={top:.3f} ≥ '
+                        f'{dedup_threshold:.3f}): {content!r}'
+                    )
+                    continue
+            except Exception as e:
+                # Search miss (e.g. collection doesn't exist yet) is non-fatal.
+                log.debug(f'auto-memory: dedup search skipped: {e}')
+
+        try:
+            memory = await Memories.insert_new_memory(user.id, content)
+            if memory is None:
+                continue
+            await ASYNC_VECTOR_DB_CLIENT.upsert(
+                collection_name=f'user-memory-{user.id}',
+                items=[
+                    {
+                        'id': memory.id,
+                        'text': memory.content,
+                        'vector': vector,
+                        'metadata': {'created_at': memory.created_at},
+                    }
+                ],
+            )
+            persisted.append({'id': memory.id, 'content': memory.content})
+            # Update existing list inline so subsequent candidates dedup
+            # against memories we just wrote in this same turn.
+            existing_contents.append(memory.content)
+        except Exception as e:
+            log.warning(f'auto-memory: failed to persist memory {content!r}: {e}')
+            continue
+
+    if persisted and event_emitter:
+        try:
+            await event_emitter(
+                {
+                    'type': 'chat:memory:added',
+                    'data': {'memories': persisted},
+                }
+            )
+        except Exception as e:
+            log.debug(f'auto-memory: event emit failed: {e}')
+
+    if persisted:
+        log.info(
+            f'auto-memory: persisted {len(persisted)} memor'
+            f'{"y" if len(persisted) == 1 else "ies"} for user {user.id} '
+            f'from chat {chat_id}'
+        )
+
+
 async def chat_web_search_handler(request: Request, form_data: dict, extra_params: dict, user):
     event_emitter = extra_params['__event_emitter__']
     await event_emitter(
@@ -1506,6 +1786,79 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
 
     messages = form_data['messages']
     user_message = get_last_user_message(messages)
+
+    # Pure date/time questions answer themselves from the server clock — no
+    # Kagi call, no NL-filter LLM call, no Playwright fetch, no embed. We
+    # inject a synthetic web_search-typed file whose page_content is the
+    # current datetime so the downstream model sees it as a "source" exactly
+    # the way it sees real search results. Honors the user's IANA timezone
+    # surfaced through ``variables['{{CURRENT_TIMEZONE}}']`` (set by
+    # Open WebUI from the browser).
+    if is_pure_datetime_query(user_message):
+        # Prefer the values Open WebUI already substituted from the browser
+        # (variables dict) over computing them server-side: the container has
+        # no IANA tzdata, so ``ZoneInfo("America/New_York")`` would raise and
+        # we'd fall back to a UTC clock that doesn't match what the user sees.
+        #
+        # NOTE: ``variables`` is popped off ``form_data`` in ``process_chat_payload``
+        # before any feature handler runs (see the ``variables = form_data.pop(...)``
+        # call just above the features dispatch), so we read it from the metadata
+        # copy that survives the whole pipeline. Falling back to ``form_data``
+        # keeps this resilient if a future caller invokes the handler directly.
+        metadata = extra_params.get('__metadata__') or {}
+        variables = metadata.get('variables') or form_data.get('variables') or {}
+        tz_name = variables.get('{{CURRENT_TIMEZONE}}') or None
+        answer = synthesize_datetime_answer(
+            tz_name,
+            current_date=variables.get('{{CURRENT_DATE}}'),
+            current_time=variables.get('{{CURRENT_TIME}}'),
+            current_weekday=variables.get('{{CURRENT_WEEKDAY}}'),
+        )
+        log.debug(
+            'chat_web_search_handler: short-circuited datetime query=%r tz=%s',
+            user_message,
+            tz_name,
+        )
+        # Mirror the exact dict shape ``process_web_search`` emits on the
+        # BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL path (retrieval.py
+        # ``return {'docs': [{'content': ..., 'metadata': ...}], ...}``).
+        # ``get_sources_from_items`` reads ``doc.get('content')`` /
+        # ``doc.get('metadata')``, so plain dicts — *not* langchain Document
+        # objects — are required for JSON serialization to succeed downstream.
+        synthetic_url = 'urn:open-webui:system-clock'
+        files = form_data.get('files', []) or []
+        files.append(
+            {
+                'docs': [
+                    {
+                        'content': answer,
+                        'metadata': {
+                            'source': synthetic_url,
+                            'title': 'System clock',
+                            'snippet': answer,
+                            'link': synthetic_url,
+                        },
+                    }
+                ],
+                'name': user_message,
+                'type': 'web_search',
+                'urls': [synthetic_url],
+                'queries': [user_message],
+            }
+        )
+        form_data['files'] = files
+        await event_emitter(
+            {
+                'type': 'status',
+                'data': {
+                    'action': 'web_search',
+                    'description': 'Answered from system clock',
+                    'urls': ['urn:open-webui:system-clock'],
+                    'done': True,
+                },
+            }
+        )
+        return form_data
 
     queries = []
     try:
@@ -1554,6 +1907,49 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
     except Exception as e:
         log.exception(e)
         queries = [user_message or '']
+
+    # Drop datetime-only sub-queries before they reach Kagi. The query
+    # generator (small task model) routinely emits "Today's date" /
+    # "Current date" / "Date and time" from any prompt that mentions
+    # time-of-day; those have no useful web results and Kagi was returning
+    # zero hits, which used to bubble up as "No results found from web
+    # search". We keep the rest of the generated queries (real search
+    # intents) and run them as normal.
+    queries = [q for q in queries if isinstance(q, str) and not is_pure_datetime_query(q)]
+
+    # Dedupe near-identical queries. Small task models (gemma-3-1b in
+    # particular) like to emit the same query with trivial wording tweaks
+    # ("BMW Neue Klasse specifications" + "BMW Neue Klasse specifications
+    # documentation"); each duplicate burns a Kagi call + an NL-filter
+    # LLM call + a slot in the RAG batch. Normalize by lowercasing and
+    # collapsing whitespace; keep first occurrence so the prompt-mandated
+    # verbatim-user-message query stays at index 0.
+    _seen: set[str] = set()
+    _deduped: list[str] = []
+    for q in queries:
+        norm = re.sub(r'\s+', ' ', q.strip().lower())
+        if norm and norm not in _seen:
+            _seen.add(norm)
+            _deduped.append(q.strip())
+    queries = _deduped
+
+    # Hard cap on generated-query count. The QUERY_GENERATION prompt asks
+    # for 1-3 queries, but task models routinely overshoot (observed:
+    # gemma-3-1b emitting 10 near-duplicate variants for one prompt,
+    # producing 10× the Kagi calls + 10× the NL-filter LLM calls + a 51K-
+    # token RAG batch that wedged the MLX sidecar for 145s). Truncate
+    # post-dedupe so the cap counts unique queries, not LLM noise.
+    try:
+        _cap = int(os.environ.get('WEB_SEARCH_MAX_QUERIES', '3'))
+    except ValueError:
+        _cap = 3
+    if _cap > 0 and len(queries) > _cap:
+        log.info(
+            'middleware: capping generated queries from %d to %d '
+            '(WEB_SEARCH_MAX_QUERIES); dropped=%r',
+            len(queries), _cap, queries[_cap:],
+        )
+        queries = queries[:_cap]
 
     # Check if generated queries are empty
     if len(queries) == 1 and queries[0].strip() == '':
@@ -2414,6 +2810,17 @@ async def process_chat_payload(request, form_data, user, metadata, model):
             )  # Required to handle system prompt variables
         except Exception:
             pass
+    elif ENABLE_DEFAULT_DATETIME_SYSTEM_PROMPT and DEFAULT_DATETIME_SYSTEM_PROMPT:
+        # No user/model/folder system prompt — inject a minimal baseline so the
+        # model knows the current date/time. Without this, stock models with no
+        # tools enabled refuse to answer simple questions like "what's today's
+        # date?". Folder/tool system prompts (handled below) will append to this.
+        try:
+            form_data = await apply_system_prompt_to_body(
+                DEFAULT_DATETIME_SYSTEM_PROMPT, form_data, metadata, user
+            )
+        except Exception:
+            pass
 
     form_data = await convert_url_images_to_base64(form_data, user=user)
 
@@ -3270,6 +3677,25 @@ async def background_tasks_handler(ctx):
                         except Exception as e:
                             pass
 
+    # Auto-memory extraction runs alongside title/tags/follow-ups. It is gated
+    # on its own global flag (default off), so we don't key it on the per-chat
+    # ``tasks`` dict — once an admin enables it, it runs for every persisted
+    # turn that has a real user message. All errors are swallowed inside the
+    # handler so this can never fail a response.
+    try:
+        await chat_memory_extract_handler(
+            {
+                'request': request,
+                'user': user,
+                'metadata': metadata,
+                'messages': messages,
+                'message': message,
+                'event_emitter': event_emitter,
+            }
+        )
+    except Exception as e:
+        log.debug(f'auto-memory: background handler raised: {e}')
+
 
 async def outlet_filter_handler(ctx):
     """Run outlet filters inline after chat completion.
@@ -3866,6 +4292,7 @@ async def streaming_chat_response_handler(response, ctx):
             usage = None
             prior_output = []
             last_response_id = None
+            cohere_grounded_pending = ''
 
             def full_output():
                 return prior_output + output if prior_output else output
@@ -3924,6 +4351,7 @@ async def streaming_chat_response_handler(response, ctx):
                     nonlocal output
                     nonlocal prior_output
                     nonlocal last_response_id
+                    nonlocal cohere_grounded_pending
 
                     response_tool_calls = []
 
@@ -4224,6 +4652,17 @@ async def streaming_chat_response_handler(response, ctx):
 
                                     value = delta.get('content')
 
+                                    # Strip Cohere grounded-generation wrappers
+                                    # before any downstream processing. Held
+                                    # tail (a partial `<|...`) is carried into
+                                    # the next chunk so wrappers split across
+                                    # streaming boundaries still get removed.
+                                    if value or cohere_grounded_pending:
+                                        combined = cohere_grounded_pending + (value or '')
+                                        value, cohere_grounded_pending = strip_cohere_grounded_wrappers(combined)
+                                        if not value:
+                                            value = None
+
                                     reasoning_content = (
                                         delta.get('reasoning_content')
                                         or delta.get('reasoning')
@@ -4442,6 +4881,17 @@ async def streaming_chat_response_handler(response, ctx):
                                 log.debug(f'Error: {e}')
                                 continue
                     await flush_pending_delta_data()
+
+                    # Flush any partial Cohere grounded wrapper we were
+                    # holding back. If the stream ended mid-wrapper it isn't
+                    # actually a wrapper, so emit the held text rather than
+                    # silently dropping model output.
+                    if cohere_grounded_pending:
+                        if output and output[-1].get('type') == 'message':
+                            parts = output[-1].get('content', [])
+                            if parts and parts[-1].get('type') == 'output_text':
+                                parts[-1]['text'] += cohere_grounded_pending
+                        cohere_grounded_pending = ''
 
                     if output:
                         # Clean up the last message item

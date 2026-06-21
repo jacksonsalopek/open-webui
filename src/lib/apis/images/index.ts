@@ -218,7 +218,9 @@ export const imageGenerations = async (token: string = '', prompt: string) => {
 			console.error(err);
 			if ('detail' in err) {
 				if (Array.isArray(err.detail)) {
-					error = err.detail.map((e: { msg?: string }) => e.msg || JSON.stringify(e)).join(', ');
+					error = err.detail
+						.map((e: { msg?: string }) => e.msg || JSON.stringify(e))
+						.join(', ');
 				} else {
 					error = err.detail;
 				}
@@ -272,7 +274,9 @@ export const imageEdits = async (
 			console.error(err);
 			if ('detail' in err) {
 				if (Array.isArray(err.detail)) {
-					error = err.detail.map((e: { msg?: string }) => e.msg || JSON.stringify(e)).join(', ');
+					error = err.detail
+						.map((e: { msg?: string }) => e.msg || JSON.stringify(e))
+						.join(', ');
 				} else {
 					error = err.detail;
 				}

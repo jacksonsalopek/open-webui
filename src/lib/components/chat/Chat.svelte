@@ -233,7 +233,7 @@
 
 			// Process any queued requests if the chat is idle
 			const lastMessage = history.currentId ? history.messages[history.currentId] : null;
-			const isIdle = !lastMessage || lastMessage.role !== 'assistant' || lastMessage.done;
+			const isIdle = lastMessage?.role !== 'assistant' || lastMessage.done;
 			if (isIdle) {
 				await processNextInQueue(chatIdProp);
 			}
@@ -1556,7 +1556,7 @@
 	const chatCompletedHandler = async (_chatId, modelId, responseMessageId, messages) => {
 		// Backend handles outlet filters and persistence inline.
 		// Just refresh the sidebar chat list.
-		if ($chatId == _chatId && !$temporaryChatEnabled) {
+		if ($chatId === _chatId && !$temporaryChatEnabled) {
 			currentChatPage.set(1);
 			await chats.set(await getChatList(localStorage.token, $currentChatPage));
 		}
@@ -1587,7 +1587,7 @@
 			return null;
 		});
 
-		if (res !== null && res.messages) {
+		if (res?.messages) {
 			// Update chat history with the new messages
 			for (const message of res.messages) {
 				history.messages[message.id] = {
@@ -1600,7 +1600,7 @@
 			}
 		}
 
-		if ($chatId == _chatId) {
+		if ($chatId === _chatId) {
 			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,
@@ -1777,7 +1777,7 @@
 			} else {
 				// Stream response
 				let value = choices[0]?.delta?.content ?? '';
-				if (message.content == '' && value == '\n') {
+				if (message.content === '' && value === '\n') {
 					console.log('Empty response');
 				} else {
 					message.content += value;
@@ -2376,7 +2376,7 @@
 			if (toolId.startsWith('direct_server:')) {
 				let serverId = toolId.replace('direct_server:', '');
 				// Check if serverId is a number
-				if (!isNaN(parseInt(serverId))) {
+				if (!Number.isNaN(parseInt(serverId))) {
 					toolServerIds.push(parseInt(serverId));
 				} else {
 					toolServerIds.push(serverId);
@@ -2720,7 +2720,7 @@
 		console.log('continueResponse');
 		const _chatId = JSON.parse(JSON.stringify($chatId));
 
-		if (history.currentId && history.messages[history.currentId].done == true) {
+		if (history.currentId && history.messages[history.currentId].done === true) {
 			const responseMessage = history.messages[history.currentId];
 			responseMessage.done = false;
 			await tick();
@@ -2761,7 +2761,7 @@
 				responses
 			);
 
-			if (res && res.ok && res.body && generating) {
+			if (res?.ok && res.body && generating) {
 				generationController = controller as AbortController;
 				const textStream = await createOpenAITextStream(
 					res.body,
@@ -2775,7 +2775,7 @@
 						break;
 					}
 
-					if (mergedResponse.content == '' && value == '\n') {
+					if (mergedResponse.content === '' && value === '\n') {
 						continue;
 					} else {
 						mergedResponse.content += value;
@@ -2837,7 +2837,7 @@
 	};
 
 	const saveChatHandler = async (_chatId, history) => {
-		if ($chatId == _chatId) {
+		if ($chatId === _chatId) {
 			if (!$temporaryChatEnabled) {
 				chat = await updateChatById(localStorage.token, _chatId, {
 					models: selectedModels,

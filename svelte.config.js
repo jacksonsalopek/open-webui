@@ -27,8 +27,9 @@ const config = {
 					// or current timestamp
 					try {
 						return (
-							JSON.parse(fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8'))
-								?.version || Date.now().toString()
+							JSON.parse(
+								fs.readFileSync(new URL('./package.json', import.meta.url), 'utf8')
+							)?.version || Date.now().toString()
 						);
 					} catch {
 						return Date.now().toString();

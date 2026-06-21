@@ -863,6 +863,22 @@ ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION = (
     os.getenv('ENABLE_CHAT_RESPONSE_BASE64_IMAGE_URL_CONVERSION', 'False').lower() == 'true'
 )
 
+# When no system prompt is provided by the user/model/folder, inject a tiny
+# baseline that gives the model the current date/time/weekday. Without this,
+# stock models (with no tools enabled) say "I don't have access to real-time
+# information" when asked simple questions like "what's today's date?".
+ENABLE_DEFAULT_DATETIME_SYSTEM_PROMPT = (
+    os.getenv('ENABLE_DEFAULT_DATETIME_SYSTEM_PROMPT', 'True').lower() == 'true'
+)
+
+# Override the default datetime baseline injected when no system prompt is set.
+# Supports the same template variables as other prompts ({{CURRENT_DATE}},
+# {{CURRENT_TIME}}, {{CURRENT_DATETIME}}, {{CURRENT_WEEKDAY}}, etc.).
+DEFAULT_DATETIME_SYSTEM_PROMPT = os.getenv(
+    'DEFAULT_DATETIME_SYSTEM_PROMPT',
+    'Current date and time: {{CURRENT_WEEKDAY}}, {{CURRENT_DATETIME}}.',
+)
+
 # When enabled, uses a hardcoded extension-to-MIME dictionary as a last-resort
 # fallback when both mimetypes.guess_type() and file.meta.content_type fail to
 # determine the content type. This can help on minimal container images (e.g.

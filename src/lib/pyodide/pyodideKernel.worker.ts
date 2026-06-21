@@ -64,10 +64,20 @@ const executeCode = async (id: string, code: string) => {
 		// Dynamically load required packages based on imports in the Python code
 		await self.pyodide.loadPackagesFromImports(code, {
 			messageCallback: (msg: string) => {
-				self.postMessage({ type: 'stdout', id, package: true, message: `[package] ${msg}` });
+				self.postMessage({
+					type: 'stdout',
+					id,
+					package: true,
+					message: `[package] ${msg}`
+				});
 			},
 			errorCallback: (msg: string) => {
-				self.postMessage({ type: 'stderr', id, package: true, message: `[package] ${msg}` });
+				self.postMessage({
+					type: 'stderr',
+					id,
+					package: true,
+					message: `[package] ${msg}`
+				});
 			}
 		});
 

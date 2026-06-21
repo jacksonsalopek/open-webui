@@ -314,7 +314,7 @@
 			);
 		}
 
-		if (fileResponse && fileResponse.ok) {
+		if (fileResponse?.ok) {
 			const reader = fileResponse.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))
@@ -365,7 +365,7 @@
 				`FROM @${modelFileDigest}\n${modelFileContent}`
 			);
 
-			if (res && res.ok) {
+			if (res?.ok) {
 				const reader = res.body
 					.pipeThrough(new TextDecoderStream())
 					.pipeThrough(splitStream('\n'))
@@ -509,7 +509,7 @@
 			return null;
 		});
 
-		if (res && res.ok) {
+		if (res?.ok) {
 			const reader = res.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))

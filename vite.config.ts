@@ -21,7 +21,11 @@ export default defineConfig({
 		APP_BUILD_HASH: JSON.stringify(process.env.APP_BUILD_HASH || 'dev-build')
 	},
 	build: {
-		sourcemap: true
+		// Disabled in prod to cut Rollup peak RSS roughly in half (carrying the
+		// pre-transform source text + VLQ mappings through every plugin doubles
+		// memory). Set to 'hidden' if we ever need maps for error reporting
+		// without shipping them to the client.
+		sourcemap: process.env.ENV === 'dev'
 	},
 	worker: {
 		format: 'es'

@@ -48,7 +48,7 @@
 		allChatsLoaded = false;
 		chatListLoading = false;
 
-		if (folder && folder.id) {
+		if (folder?.id) {
 			const res = await getChatListByFolderId(localStorage.token, folder.id, page);
 
 			if (res) {

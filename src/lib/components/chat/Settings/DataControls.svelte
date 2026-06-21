@@ -51,7 +51,7 @@
 		reader.onload = (event) => {
 			let chats = JSON.parse(event.target.result);
 			console.log(chats);
-			if (getImportOrigin(chats) == 'openai') {
+			if (getImportOrigin(chats) === 'openai') {
 				try {
 					chats = convertOpenAIChats(chats);
 				} catch (error) {

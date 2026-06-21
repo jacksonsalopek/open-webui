@@ -1,0 +1,176 @@
+{
+	"$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+	"vcs": {
+		"enabled": true,
+		"clientKind": "git",
+		"useIgnoreFile": true
+	},
+	"files": {
+		"includes": [
+			"**/*.js",
+			"**/*.mjs",
+			"**/*.cjs",
+			"**/*.ts",
+			"**/*.mts",
+			"**/*.cts",
+			"**/*.svelte",
+			"**/*.json",
+			"**/*.jsonc",
+			"**/*.css",
+			"**/*.html",
+			"**/*.md",
+			"!**/node_modules",
+			"!**/build",
+			"!**/.svelte-kit",
+			"!**/package",
+			"!**/dist",
+			"!**/coverage",
+			"!**/pnpm-lock.yaml",
+			"!**/package-lock.json",
+			"!**/yarn.lock",
+			"!static",
+			"!cypress/videos",
+			"!cypress/screenshots",
+			"!**/vite.config.js.timestamp-*",
+			"!**/vite.config.ts.timestamp-*",
+			"!src/lib/wasm",
+			"!backend",
+			"!src/lib/components/workspace/Prompts/PromptEditor.svelte"
+		]
+	},
+	"formatter": {
+		"enabled": true,
+		"useEditorconfig": false,
+		"indentStyle": "tab",
+		"indentWidth": 4,
+		"lineWidth": 100,
+		"lineEnding": "lf",
+		"formatWithErrors": false
+	},
+	"linter": {
+		"enabled": true,
+		"rules": {
+			"recommended": true,
+			"a11y": {
+				"recommended": false
+			},
+			"complexity": {
+				"noBannedTypes": "off",
+				"noForEach": "off",
+				"useLiteralKeys": "off",
+				"useOptionalChain": "warn",
+				"useArrowFunction": "warn",
+				"noCommaOperator": "warn",
+				"noUselessSwitchCase": "off",
+				"noUselessContinue": "off",
+				"noUselessTernary": "off",
+				"noUselessRename": "off",
+				"noUselessEscapeInRegex": "off",
+				"noExtraBooleanCast": "off",
+				"noImportantStyles": "off"
+			},
+			"correctness": {
+				"noUnknownFunction": "off",
+				"useParseIntRadix": "off",
+				"noUnusedVariables": "warn",
+				"noUnusedImports": "warn",
+				"noSelfAssign": "off",
+				"noConstantCondition": "warn"
+			},
+			"style": {
+				"useImportType": "off",
+				"useTemplate": "off",
+				"useConst": "warn",
+				"useNodejsImportProtocol": "warn",
+				"noNonNullAssertion": "off",
+				"noDescendingSpecificity": "off"
+			},
+			"suspicious": {
+				"noExplicitAny": "warn",
+				"noImplicitAnyLet": "off",
+				"noDoubleEquals": "warn",
+				"noAssignInExpressions": "warn",
+				"noGlobalAssign": "warn",
+				"noAsyncPromiseExecutor": "warn",
+				"noShadowRestrictedNames": "warn",
+				"noPrototypeBuiltins": "off",
+				"noEmptyInterface": "off",
+				"noCatchAssign": "warn",
+				"noGlobalIsNan": "warn",
+				"noUselessEscapeInString": "off",
+				"useIterableCallbackReturn": "warn",
+				"noControlCharactersInRegex": "warn"
+			},
+			"performance": {
+				"noAccumulatingSpread": "off"
+			}
+		}
+	},
+	"javascript": {
+		"formatter": {
+			"quoteStyle": "single",
+			"jsxQuoteStyle": "double",
+			"trailingCommas": "none",
+			"semicolons": "always",
+			"arrowParentheses": "always",
+			"bracketSameLine": false,
+			"bracketSpacing": true
+		}
+	},
+	"json": {
+		"formatter": {
+			"trailingCommas": "none"
+		},
+		"parser": {
+			"allowComments": true,
+			"allowTrailingCommas": false
+		}
+	},
+	"css": {
+		"formatter": {
+			"quoteStyle": "double"
+		},
+		"parser": {
+			"cssModules": true,
+			"tailwindDirectives": true
+		}
+	},
+	"html": {
+		"experimentalFullSupportEnabled": true,
+		"formatter": {
+			"indentScriptAndStyle": false,
+			"selfCloseVoidElements": "always"
+		}
+	},
+	"assist": {
+		"actions": {
+			"source": {
+				"organizeImports": "off"
+			}
+		}
+	},
+	"overrides": [
+		{
+			"includes": ["src/lib/i18n/locales/**/*.json"],
+			"formatter": {
+				"lineWidth": 200
+			}
+		},
+		{
+			"includes": ["**/*.svelte"],
+			"linter": {
+				"rules": {
+					"correctness": {
+						"noUnusedVariables": "off",
+						"noUnusedImports": "off",
+						"noUnusedFunctionParameters": "off",
+						"noInvalidUseBeforeDeclaration": "off"
+					},
+					"style": {
+						"useConst": "off"
+					}
+				}
+			}
+		}
+	]
+}

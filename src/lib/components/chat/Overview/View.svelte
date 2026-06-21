@@ -41,7 +41,7 @@
 		drawFlow(layoutDirection);
 	}
 
-	$: if (history && history.currentId) {
+	$: if (history?.currentId) {
 		focusNode();
 	}
 
@@ -128,8 +128,7 @@
 	const recurseCheckChild = (nodeId, currentId) => {
 		const node = history.messages[nodeId];
 		return (
-			node.childrenIds &&
-			node.childrenIds.some((id) => id === currentId || recurseCheckChild(id, currentId))
+			node.childrenIds?.some((id) => id === currentId || recurseCheckChild(id, currentId))
 		);
 	};
 

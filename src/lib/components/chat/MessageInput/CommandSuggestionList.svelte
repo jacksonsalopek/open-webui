@@ -46,7 +46,7 @@
 	};
 
 	// This method will be called from the suggestion renderer
-	// @ts-ignore
+	// @ts-expect-error
 	export function _onKeyDown(event: KeyboardEvent) {
 		return onKeyDown(event);
 	}

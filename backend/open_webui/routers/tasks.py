@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response, status
 from fastapi.responses import JSONResponse, RedirectResponse
 from open_webui.config import (
     DEFAULT_AUTOCOMPLETE_GENERATION_PROMPT_TEMPLATE,
+    DEFAULT_AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE,
     DEFAULT_EMOJI_GENERATION_PROMPT_TEMPLATE,
     DEFAULT_FOLLOW_UP_GENERATION_PROMPT_TEMPLATE,
     DEFAULT_IMAGE_PROMPT_GENERATION_PROMPT_TEMPLATE,
@@ -20,6 +21,7 @@ from open_webui.routers.pipelines import process_pipeline_inlet_filter
 from open_webui.utils.auth import get_admin_user, get_verified_user
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.task import (
+    auto_memory_extraction_template,
     autocomplete_generation_template,
     emoji_generation_template,
     follow_up_generation_template,
@@ -364,6 +366,84 @@ async def generate_chat_tags(request: Request, form_data: dict, user=Depends(get
         return await generate_chat_completion(request, form_data=payload, user=user)
     except Exception as e:
         log.error(f'Error generating chat completion: {e}')
+        return JSONResponse(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            content={'detail': 'An internal error has occurred.'},
+        )
+
+
+@router.post('/memory_extraction/completions')
+async def generate_memory_extraction(request: Request, form_data: dict, user=Depends(get_verified_user)):
+    """Distill durable user facts from the latest exchange.
+
+    Mirrors ``generate_chat_tags`` / ``generate_follow_ups``: routes through the
+    configured task model with a strict-JSON template, returning whatever the
+    model emits. The caller (``chat_memory_extract_handler``) is responsible for
+    parsing, dedup, and persistence.
+    """
+    if not request.app.state.config.ENABLE_AUTO_MEMORY_EXTRACTION:
+        return JSONResponse(
+            status_code=status.HTTP_200_OK,
+            content={'detail': 'Auto memory extraction is disabled'},
+        )
+
+    if getattr(request.state, 'direct', False) and hasattr(request.state, 'model'):
+        models = {
+            **request.app.state.MODELS,
+            request.state.model['id']: request.state.model,
+        }
+    else:
+        models = request.app.state.MODELS
+
+    model_id = form_data['model']
+    if model_id not in models:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=ERROR_MESSAGES.MODEL_NOT_FOUND(),
+        )
+
+    task_model_id = get_task_model_id(
+        model_id,
+        request.app.state.config.TASK_MODEL,
+        request.app.state.config.TASK_MODEL_EXTERNAL,
+        models,
+    )
+
+    log.debug(f'extracting memories using model {task_model_id} for user {user.email}')
+
+    if request.app.state.config.AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE != '':
+        template = request.app.state.config.AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE
+    else:
+        template = DEFAULT_AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE
+
+    content = await auto_memory_extraction_template(
+        template,
+        form_data['messages'],
+        existing_memories=form_data.get('existing_memories') or [],
+        user=user,
+    )
+
+    payload = {
+        'model': task_model_id,
+        'messages': [{'role': 'user', 'content': content}],
+        'stream': False,
+        'metadata': {
+            **(request.state.metadata if hasattr(request.state, 'metadata') else {}),
+            'task': str(TASKS.MEMORY_EXTRACTION),
+            'task_body': form_data,
+            'chat_id': form_data.get('chat_id', None),
+        },
+    }
+
+    try:
+        payload = await process_pipeline_inlet_filter(request, payload, user, models)
+    except Exception as e:
+        raise e
+
+    try:
+        return await generate_chat_completion(request, form_data=payload, user=user)
+    except Exception as e:
+        log.error(f'Error generating memory extraction: {e}')
         return JSONResponse(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             content={'detail': 'An internal error has occurred.'},

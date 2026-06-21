@@ -186,7 +186,7 @@ print("${endTag}")
 				toast.error(`${error}`);
 				return null;
 			});
-			if (res && res.code) {
+			if (res?.code) {
 				const formattedCode = res.code;
 				codeEditor.dispatch({
 					changes: [{ from: 0, to: codeEditor.state.doc.length, insert: formattedCode }]

@@ -227,7 +227,7 @@
 					const width = entry.contentRect.width;
 					minSize = Math.floor((350 / width) * 100);
 					if ($showControls) {
-						if (pane && pane.isExpanded() && pane.getSize() < minSize) {
+						if (pane?.isExpanded() && pane.getSize() < minSize) {
 							pane.resize(minSize);
 						} else {
 							let size = Math.floor(

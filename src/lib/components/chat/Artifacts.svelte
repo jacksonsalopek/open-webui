@@ -41,9 +41,9 @@
 	const iframeLoadHandler = () => {
 		iframeElement.contentWindow.addEventListener(
 			'click',
-			function (e) {
+			(e) => {
 				const target = e.target.closest('a');
-				if (target && target.href) {
+				if (target?.href) {
 					e.preventDefault();
 					const url = new URL(target.href, iframeElement.baseURI);
 					if (url.origin === window.location.origin) {
@@ -61,7 +61,7 @@
 		);
 
 		// Cancel drag when hovering over iframe
-		iframeElement.contentWindow.addEventListener('mouseenter', function (e) {
+		iframeElement.contentWindow.addEventListener('mouseenter', (e) => {
 			e.preventDefault();
 			iframeElement.contentWindow.addEventListener('dragstart', (event) => {
 				event.preventDefault();

@@ -323,6 +323,33 @@ async def tags_generation_template(template: str, messages: list[dict], user: Op
     return template
 
 
+async def auto_memory_extraction_template(
+    template: str,
+    messages: list[dict],
+    existing_memories: list[str] | None = None,
+    user: Optional[Any] = None,
+) -> str:
+    """Render the auto-memory extraction prompt.
+
+    Substitutes ``{{EXISTING_MEMORIES}}`` with a numbered list of the user's
+    current memories so the extractor can avoid duplicates, then runs the
+    standard prompt + messages variable replacement so authors can use
+    ``{{MESSAGES:END:N}}`` etc. in the template.
+    """
+    prompt = get_last_user_message(messages)
+    template = replace_prompt_variable(template, prompt)
+    template = replace_messages_variable(template, messages)
+
+    if existing_memories:
+        rendered = '\n'.join(f'- {m}' for m in existing_memories if m)
+    else:
+        rendered = '(none)'
+    template = template.replace('{{EXISTING_MEMORIES}}', rendered)
+
+    template = await prompt_template(template, user)
+    return template
+
+
 async def image_prompt_generation_template(template: str, messages: list[dict], user: Optional[Any] = None) -> str:
     prompt = get_last_user_message(messages)
     template = replace_prompt_variable(template, prompt)

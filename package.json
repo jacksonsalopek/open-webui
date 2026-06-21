@@ -11,12 +11,13 @@
 		"check": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json",
 		"check:watch": "svelte-kit sync && svelte-check --tsconfig ./tsconfig.json --watch",
 		"lint": "pnpm run lint:frontend ; pnpm run lint:types ; pnpm run lint:backend",
-		"lint:frontend": "eslint . --fix",
+		"lint:frontend": "biome lint --write .",
 		"lint:types": "pnpm run check",
 		"lint:backend": "pylint backend/",
-		"format": "prettier --plugin-search-dir --write \"**/*.{js,ts,svelte,css,md,html,json}\"",
+		"format": "biome format --write .",
 		"format:backend": "ruff format . --exclude .venv --exclude venv",
-		"i18n:parse": "i18next --config i18next-parser.config.ts && prettier --write \"src/lib/i18n/**/*.{js,json}\"",
+		"check:fix": "biome check --write .",
+		"i18n:parse": "i18next --config i18next-parser.config.ts && biome format --write src/lib/i18n",
 		"cy:open": "cypress open",
 		"test:frontend": "vitest --passWithNoTests",
 		"pyodide:fetch": "node scripts/prepare-pyodide.js"
@@ -24,22 +25,15 @@
 	"devDependencies": {
 		"@sveltejs/adapter-auto": "3.2.2",
 		"@sveltejs/adapter-static": "^3.0.2",
-		"@sveltejs/kit": "^2.5.27",
-		"@sveltejs/vite-plugin-svelte": "^4.0.0",
+		"@sveltejs/kit": "^2.66.0",
+		"@sveltejs/vite-plugin-svelte": "^6.2.4",
 		"@tailwindcss/container-queries": "^0.1.1",
+		"@biomejs/biome": "^2.5.0",
 		"@tailwindcss/postcss": "^4.0.0",
 		"@tailwindcss/typography": "^0.5.13",
-		"@typescript-eslint/eslint-plugin": "^8.31.1",
-		"@typescript-eslint/parser": "^8.31.1",
 		"cypress": "^13.15.0",
-		"eslint": "^8.56.0",
-		"eslint-config-prettier": "^9.1.0",
-		"eslint-plugin-cypress": "^3.4.0",
-		"eslint-plugin-svelte": "^2.45.1",
 		"i18next-parser": "^9.0.1",
 		"postcss": "^8.4.31",
-		"prettier": "^3.3.3",
-		"prettier-plugin-svelte": "^3.2.6",
 		"sass-embedded": "^1.81.0",
 		"svelte": "^5.53.10",
 		"svelte-check": "^4.0.0",
@@ -47,8 +41,8 @@
 		"tailwindcss": "^4.0.0",
 		"tslib": "^2.4.1",
 		"typescript": "^5.5.4",
-		"vite": "^5.4.21",
-		"vitest": "^1.6.1"
+		"vite": "^7.3.5",
+		"vitest": "^3.2.6"
 	},
 	"type": "module",
 	"dependencies": {
@@ -154,7 +148,7 @@
 		"uuid": "^9.0.1",
 		"vega": "^6.2.0",
 		"vega-lite": "^6.4.1",
-		"vite-plugin-static-copy": "^2.2.0",
+		"vite-plugin-static-copy": "^4.1.1",
 		"xlsx": "^0.18.5",
 		"y-prosemirror": "^1.3.7",
 		"y-protocols": "^1.0.7",
@@ -162,7 +156,7 @@
 		"yjs": "^13.6.27"
 	},
 	"engines": {
-		"node": ">=18.13.0 <=22.x.x",
+		"node": "^20.19.0 || >=22.12.0",
 		"pnpm": ">=9.0.0"
 	},
 	"packageManager": "pnpm@9.15.9+sha512.68046141893c66fad01c079231128e9afb89ef87e2691d69e4d40eee228988295fd4682181bae55b58418c3a253bde65a505ec7c5f9403ece5cc3cd37dcf2531"

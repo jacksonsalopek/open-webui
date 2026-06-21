@@ -203,7 +203,7 @@ Based on the user's instruction, update and enhance the existing notes or select
 
 		let messageContent = '';
 
-		if (res && res.ok) {
+		if (res?.ok) {
 			const reader = res.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))
@@ -235,7 +235,7 @@ Based on the user's instruction, update and enhance the existing notes or select
 								if (editEnabled) {
 									responseMessage.content = `<status title="${$i18n.t('Edited')}" done="true" />`;
 
-									if (selectedContent && selectedContent?.text && editor) {
+									if (selectedContent?.text && editor) {
 										editor.commands.insertContentAt(
 											{
 												from: selectedContent.from,
@@ -255,7 +255,7 @@ Based on the user's instruction, update and enhance the existing notes or select
 								console.log(data);
 
 								let deltaContent = data.choices[0]?.delta?.content ?? '';
-								if (responseMessage.content == '' && deltaContent == '\n') {
+								if (responseMessage.content === '' && deltaContent === '\n') {
 									continue;
 								} else {
 									if (editEnabled) {
@@ -265,7 +265,7 @@ Based on the user's instruction, update and enhance the existing notes or select
 										enhancedContent.md += deltaContent;
 										enhancedContent.html = marked.parse(enhancedContent.md);
 
-										if (!selectedContent || !selectedContent?.text) {
+										if (!selectedContent?.text) {
 											note.data.content.md = enhancedContent.md;
 											note.data.content.html = enhancedContent.html;
 											note.data.content.json = null;

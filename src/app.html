@@ -35,7 +35,7 @@
 		<link rel="stylesheet" href="/static/custom.css" crossorigin="use-credentials" />
 
 		<script>
-			function resizeIframe(obj) {
+			function _resizeIframe(obj) {
 				obj.style.height = obj.contentWindow.document.documentElement.scrollHeight + 'px';
 			}
 		</script>
@@ -104,7 +104,7 @@
 				logo.fetchPriority = 'high';
 				logo.src = isDarkMode ? '/static/splash-dark.png' : '/static/splash.png';
 
-				document.addEventListener('DOMContentLoaded', function () {
+				document.addEventListener('DOMContentLoaded', () => {
 					const splash = document.getElementById('splash-screen');
 					if (document.documentElement.classList.contains('her')) {
 						return;

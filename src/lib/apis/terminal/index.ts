@@ -29,7 +29,7 @@ export const getTerminalServers = async (token: string): Promise<TerminalServer[
 			Authorization: `Bearer ${token}`
 		}
 	}).catch(() => null);
-	if (!res || !res.ok) return [];
+	if (!res?.ok) return [];
 	return res.json().catch(() => []);
 };
 
@@ -41,7 +41,7 @@ export const getTerminalConfig = async (
 	const res = await fetch(url, {
 		headers: { Authorization: `Bearer ${apiKey}` }
 	}).catch(() => null);
-	if (!res || !res.ok) return null;
+	if (!res?.ok) return null;
 	return res.json().catch(() => null);
 };
 
@@ -54,7 +54,7 @@ export const getCwd = async (
 	const headers: Record<string, string> = { Authorization: `Bearer ${apiKey}` };
 	if (sessionId) headers['X-Session-Id'] = sessionId;
 	const res = await fetch(url, { headers }).catch(() => null);
-	if (!res || !res.ok) return null;
+	if (!res?.ok) return null;
 	const json = await res.json().catch(() => null);
 	return json?.cwd ?? null;
 };
@@ -95,7 +95,7 @@ export const readFile = async (
 		return null;
 	});
 
-	if (!res || !res.ok) return null;
+	if (!res?.ok) return null;
 
 	const contentType = res.headers.get('content-type') ?? '';
 	if (contentType.startsWith('image/') || contentType.startsWith('application/octet')) {
@@ -120,7 +120,7 @@ export const downloadFileBlob = async (
 	if (sessionId) headers['X-Session-Id'] = sessionId;
 	const res = await fetch(url, { headers }).catch(() => null);
 
-	if (!res || !res.ok) return null;
+	if (!res?.ok) return null;
 
 	const filename = path.split('/').pop() ?? 'file';
 	const blob = await res.blob();
@@ -145,7 +145,7 @@ export const archiveFromTerminal = async (
 		body: JSON.stringify({ paths })
 	}).catch(() => null);
 
-	if (!res || !res.ok) return null;
+	if (!res?.ok) return null;
 
 	const disposition = res.headers.get('content-disposition') ?? '';
 	const match = disposition.match(/filename="?([^"]+)"?/);
@@ -299,7 +299,7 @@ export const getListeningPorts = async (
 	const res = await fetch(url, {
 		headers: { Authorization: `Bearer ${apiKey}` }
 	}).catch(() => null);
-	if (!res || !res.ok) return [];
+	if (!res?.ok) return [];
 	const json = await res.json().catch(() => null);
 	return json?.ports ?? [];
 };

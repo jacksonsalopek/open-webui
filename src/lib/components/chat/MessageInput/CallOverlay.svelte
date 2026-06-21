@@ -279,7 +279,7 @@
 
 		if (!audioStream) return;
 
-		audioStream.getAudioTracks().forEach(function (track) {
+		audioStream.getAudioTracks().forEach((track) => {
 			track.stop();
 		});
 

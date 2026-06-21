@@ -14,7 +14,11 @@ export const flyAndScale = (node: Element, params?: FlyAndScaleParams): Transiti
 	const transform = style.transform === 'none' ? '' : style.transform;
 	const withDefaults = { ...defaultFlyAndScaleParams, ...params };
 
-	const scaleConversion = (valueA: number, scaleA: [number, number], scaleB: [number, number]) => {
+	const scaleConversion = (
+		valueA: number,
+		scaleA: [number, number],
+		scaleB: [number, number]
+	) => {
 		const [minA, maxA] = scaleA;
 		const [minB, maxB] = scaleB;
 

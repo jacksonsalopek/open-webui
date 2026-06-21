@@ -109,7 +109,11 @@ export function listDragHandlePlugin(options = {}) {
 				node.content.forEach((li) => {
 					normalizedItems.push(normalizeItemForList(state, li, parentTargetListNode));
 				});
-				return wantedListType.create(node.attrs, Fragment.from(normalizedItems), node.marks);
+				return wantedListType.create(
+					node.attrs,
+					Fragment.from(normalizedItems),
+					node.marks
+				);
 			}
 
 			// Not a list node → but may contain lists deeper
@@ -145,7 +149,9 @@ export function listDragHandlePlugin(options = {}) {
 		if (wantedItemTypeName !== itemNode.type.name) {
 			// If changing type, ensure no disallowed marks are kept
 			const allowed = wantedType.spec?.marks;
-			const marks = allowed ? itemNode.marks.filter((m) => allowed.includes(m.type.name)) : [];
+			const marks = allowed
+				? itemNode.marks.filter((m) => allowed.includes(m.type.name))
+				: [];
 
 			console.log(normalizedContent);
 			return wantedType.create(newAttrs, Fragment.from(normalizedContent), marks);
@@ -176,7 +182,7 @@ export function listDragHandlePlugin(options = {}) {
 			decos.push(
 				Decoration.widget(
 					pos + 1,
-					(view, getPos) => {
+					(_view, getPos) => {
 						const el = document.createElement('span');
 						el.className = classHandle;
 						el.setAttribute('title', handleTitle);
@@ -240,7 +246,7 @@ export function listDragHandlePlugin(options = {}) {
 	});
 
 	const apply = (tr, prev) => {
-		let decorations = tr.docChanged
+		const decorations = tr.docChanged
 			? buildHandleDecos(tr.doc)
 			: prev.decorations.map(tr.mapping, tr.doc);
 		let next = { ...prev, decorations };
@@ -332,7 +338,8 @@ export function listDragHandlePlugin(options = {}) {
 					? schema.nodes.taskList
 						? 'taskList'
 						: null
-					: parentList.type.name === 'orderedList' || parentList.type.name === 'ordered_list'
+					: parentList.type.name === 'orderedList' ||
+							parentList.type.name === 'ordered_list'
 						? schema.nodes.orderedList
 							? 'orderedList'
 							: schema.nodes.ordered_list
@@ -403,7 +410,9 @@ export function listDragHandlePlugin(options = {}) {
 
 					try {
 						view.dispatch(
-							view.state.tr.setSelection(NodeSelection.create(view.state.doc, fromStart))
+							view.state.tr.setSelection(
+								NodeSelection.create(view.state.doc, fromStart)
+							)
 						);
 					} catch {}
 
@@ -429,7 +438,11 @@ export function listDragHandlePlugin(options = {}) {
 						// for before/after: obvious
 						// for into/outdent: we still insert AFTER target and then run sink/lift
 						const toPos =
-							info.mode === 'before' ? info.start : info.mode === 'after' ? info.end : info.end; // into/outdent insert after target
+							info.mode === 'before'
+								? info.start
+								: info.mode === 'after'
+									? info.end
+									: info.end; // into/outdent insert after target
 
 						const prev = listPointerDragKey.getState(view.state)?.dropTarget;
 						if (
@@ -438,7 +451,12 @@ export function listDragHandlePlugin(options = {}) {
 							prev.end !== info.end ||
 							prev.mode !== info.mode
 						) {
-							setDrop(view, { start: info.start, end: info.end, mode: info.mode, toPos });
+							setDrop(view, {
+								start: info.start,
+								end: info.end,
+								mode: info.mode,
+								toPos
+							});
 						}
 					};
 
@@ -477,11 +495,15 @@ export function listDragHandlePlugin(options = {}) {
 									// Select the moved node so sink/lift applies to it
 									editor.commands.setNodeSelection(res.newStart);
 
-									const typeName = getListItemTypeNameAt(view.state.doc, res.newStart);
+									const typeName = getListItemTypeNameAt(
+										view.state.doc,
+										res.newStart
+									);
 									const chain = editor.chain().focus();
 
 									if (mode === 'into') {
-										if (editor.can().sinkListItem?.(typeName)) chain.sinkListItem(typeName).run();
+										if (editor.can().sinkListItem?.(typeName))
+											chain.sinkListItem(typeName).run();
 										else chain.run();
 									} else {
 										chain.run(); // finalize focus/selection

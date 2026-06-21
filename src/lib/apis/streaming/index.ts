@@ -4,9 +4,9 @@ import type { ParsedEvent } from 'eventsource-parser';
 type TextStreamUpdate = {
 	done: boolean;
 	value: string;
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	// biome-ignore lint/suspicious/noExplicitAny: source payload is untyped upstream
 	sources?: any;
-	// eslint-disable-next-line @typescript-eslint/no-explicit-any
+	// biome-ignore lint/suspicious/noExplicitAny: model id payload is untyped upstream
 	selectedModelId?: any;
 	error?: any;
 	usage?: ResponseUsage;
@@ -125,7 +125,7 @@ async function* streamLargeDeltasAsRandomChunks(
 			yield { done: false, value: content };
 			continue;
 		}
-		while (content != '') {
+		while (content !== '') {
 			const chunkSize = Math.min(Math.floor(Math.random() * 3) + 1, content.length);
 			const chunk = content.slice(0, chunkSize);
 			yield { done: false, value: chunk };

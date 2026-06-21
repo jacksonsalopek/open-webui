@@ -115,7 +115,7 @@
 						boxWidth: 8,
 						boxHeight: 8,
 						callbacks: {
-							label: function (context: any) {
+							label: (context: any) => {
 								const value = Math.abs(context.raw);
 								return `${context.dataset.label}: ${value}`;
 							}
@@ -149,7 +149,7 @@
 							padding: 8,
 							stepSize: 1,
 							precision: 0,
-							callback: function (value: number) {
+							callback: (value: number) => {
 								return Math.abs(value); // Show absolute values on y-axis
 							}
 						},

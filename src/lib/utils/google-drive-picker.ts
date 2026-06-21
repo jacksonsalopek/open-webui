@@ -31,7 +31,7 @@ const validateCredentials = () => {
 	}
 };
 
-let pickerApiLoaded = false;
+let _pickerApiLoaded = false;
 let oauthToken: string | null = null;
 let initialized = false;
 
@@ -42,7 +42,7 @@ export const loadGoogleDriveApi = () => {
 			script.src = 'https://apis.google.com/js/api.js';
 			script.onload = () => {
 				gapi.load('picker', () => {
-					pickerApiLoaded = true;
+					_pickerApiLoaded = true;
 					resolve(true);
 				});
 			};
@@ -50,7 +50,7 @@ export const loadGoogleDriveApi = () => {
 			document.body.appendChild(script);
 		} else {
 			gapi.load('picker', () => {
-				pickerApiLoaded = true;
+				_pickerApiLoaded = true;
 				resolve(true);
 			});
 		}
@@ -137,7 +137,7 @@ export const createPicker = () => {
 							const doc = data[google.picker.Response.DOCUMENTS][0];
 							const fileId = doc[google.picker.Document.ID];
 							const fileName = doc[google.picker.Document.NAME];
-							const fileUrl = doc[google.picker.Document.URL];
+							const _fileUrl = doc[google.picker.Document.URL];
 
 							if (!fileId || !fileName) {
 								throw new Error('Required file details missing');
@@ -180,7 +180,9 @@ export const createPicker = () => {
 									statusText: response.statusText,
 									error: errorText
 								});
-								throw new Error(`Failed to download file (${response.status}): ${errorText}`);
+								throw new Error(
+									`Failed to download file (${response.status}): ${errorText}`
+								);
 							}
 
 							const blob = await response.blob();
@@ -198,7 +200,9 @@ export const createPicker = () => {
 						} catch (error) {
 							reject(error);
 						}
-					} else if (data[google.picker.Response.ACTION] === google.picker.Action.CANCEL) {
+					} else if (
+						data[google.picker.Response.ACTION] === google.picker.Action.CANCEL
+					) {
 						resolve(null);
 					}
 				})

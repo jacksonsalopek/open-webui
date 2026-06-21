@@ -306,7 +306,7 @@ ${content}
 					const jsonResponse = response.substring(jsonStartIndex, jsonEndIndex + 1);
 					const parsed = JSON.parse(jsonResponse);
 
-					if (parsed && parsed.title) {
+					if (parsed?.title) {
 						note.title = parsed.title.trim();
 					}
 				}
@@ -423,7 +423,7 @@ ${content}
 			itemId: tempItemId
 		};
 
-		if (fileItem.size == 0) {
+		if (fileItem.size === 0) {
 			toast.error($i18n.t('You cannot upload an empty file.'));
 			return null;
 		}
@@ -677,7 +677,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 
 		streaming = true;
 
-		if (res && res.ok) {
+		if (res?.ok) {
 			const reader = res.body
 				.pipeThrough(new TextDecoderStream())
 				.pipeThrough(splitStream('\n'))
@@ -709,7 +709,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 
 								if (data.choices && data.choices.length > 0) {
 									const choice = data.choices[0];
-									if (choice.delta && choice.delta.content) {
+									if (choice.delta?.content) {
 										enhancedContent.md += choice.delta.content;
 										enhancedContent.html = marked.parse(enhancedContent.md);
 
@@ -791,7 +791,7 @@ Provide the enhanced notes in markdown format. Use markdown syntax for headings,
 			note.access_grants = _note.access_grants;
 		}
 
-		if (_note.data && _note.data.files) {
+		if (_note.data?.files) {
 			files = _note.data.files;
 			note.data.files = files;
 		}

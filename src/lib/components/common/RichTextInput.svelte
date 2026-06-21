@@ -44,9 +44,7 @@
 	// This rule eliminates that hack so <pre><code> content is untouched.
 	turndownService.addRule('singleNewlineParagraphs', {
 		filter: 'p',
-		replacement: function (content) {
-			return '\n' + content + '\n';
-		}
+		replacement: (content) => '\n' + content + '\n'
 	});
 
 	// Use turndown-plugin-gfm for proper GFM table support
@@ -55,15 +53,13 @@
 	// Add custom table header rule before using GFM plugin
 	turndownService.addRule('tableHeaders', {
 		filter: 'th',
-		replacement: function (content, node) {
-			return content;
-		}
+		replacement: (content, node) => content
 	});
 
 	// Add custom table rule to handle headers properly
 	turndownService.addRule('tables', {
 		filter: 'table',
-		replacement: function (content, node) {
+		replacement: (content, node) => {
 			// Extract rows
 			const rows = Array.from(node.querySelectorAll('tr'));
 			if (rows.length === 0) return content;
@@ -99,7 +95,7 @@
 			node.nodeName === 'LI' &&
 			(node.getAttribute('data-checked') === 'true' ||
 				node.getAttribute('data-checked') === 'false'),
-		replacement: function (content, node) {
+		replacement: (content, node) => {
 			const checked = node.getAttribute('data-checked') === 'true';
 			content = content.replace(/^\s+/, '');
 			return `- [${checked ? 'x' : ' '}] ${content}\n`;
@@ -449,7 +445,7 @@
 	};
 
 	export const setText = (text: string) => {
-		if (!editor || !editor.view) return;
+		if (!editor?.view) return;
 
 		if (text === '') {
 			editor.commands.clearContent();
@@ -489,7 +485,7 @@
 	};
 
 	export const insertContent = (content) => {
-		if (!editor || !editor.view) return;
+		if (!editor?.view) return;
 		const { state, view } = editor;
 		const { schema, tr } = state;
 
@@ -514,7 +510,7 @@
 	};
 
 	export const replaceVariables = (variables) => {
-		if (!editor || !editor.view) return;
+		if (!editor?.view) return;
 		const { state, view } = editor;
 		const { doc } = state;
 
@@ -557,7 +553,7 @@
 	};
 
 	export const focus = () => {
-		if (editor && editor.view) {
+		if (editor?.view) {
 			// Check if the editor is destroyed
 			if (editor.isDestroyed) {
 				return;
@@ -700,9 +696,7 @@
 			if (preserveBreaks) {
 				turndownService.addRule('preserveBreaks', {
 					filter: 'br', // Target <br> elements
-					replacement: function (content) {
-						return '<br/>';
-					}
+					replacement: (content) => '<br/>'
 				});
 			}
 
@@ -826,7 +820,7 @@
 								},
 								shouldShow: ({ editor, view, state, oldState, from, to }) => {
 									// safety check
-									if (!editor || !editor.view || editor.isDestroyed) {
+									if (!editor?.view || editor.isDestroyed) {
 										return false;
 									}
 									// Only show when editor is focused and text is selected
@@ -843,7 +837,7 @@
 								},
 								shouldShow: ({ editor, view, state, oldState }) => {
 									// safety check
-									if (!editor || !editor.view || editor.isDestroyed) {
+									if (!editor?.view || editor.isDestroyed) {
 										return false;
 									}
 									const { selection } = state;

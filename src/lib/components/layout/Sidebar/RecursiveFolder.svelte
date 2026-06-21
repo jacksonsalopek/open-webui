@@ -105,7 +105,7 @@
 
 							// Read the JSON file with FileReader
 							const reader = new FileReader();
-							reader.onload = async function (event) {
+							reader.onload = async (event) => {
 								try {
 									const fileContent = JSON.parse(event.target.result);
 									open = true;

@@ -104,15 +104,22 @@ export const AIAutocompletion = Extension.create({
 									.generateCompletion(prompt)
 									.then((suggestion) => {
 										if (suggestion && suggestion.trim() !== '') {
-											if (view.state.selection.$head.pos === view.state.selection.$head.end()) {
+											if (
+												view.state.selection.$head.pos ===
+												view.state.selection.$head.end()
+											) {
 												if (view.state === newState) {
 													view.dispatch(
-														newState.tr.setNodeMarkup(currentPos, null, {
-															...newNode.attrs,
-															class: 'ai-autocompletion',
-															'data-prompt': prompt,
-															'data-suggestion': suggestion
-														})
+														newState.tr.setNodeMarkup(
+															currentPos,
+															null,
+															{
+																...newNode.attrs,
+																class: 'ai-autocompletion',
+																'data-prompt': prompt,
+																'data-suggestion': suggestion
+															}
+														)
 													);
 												}
 											}
@@ -166,12 +173,14 @@ export const AIAutocompletion = Extension.create({
 								// Accept suggestion
 								const suggestion = node.attrs['data-suggestion'];
 								dispatch(
-									state.tr.insertText(suggestion, $head.pos).setNodeMarkup($head.before(), null, {
-										...node.attrs,
-										class: null,
-										'data-prompt': null,
-										'data-suggestion': null
-									})
+									state.tr
+										.insertText(suggestion, $head.pos)
+										.setNodeMarkup($head.before(), null, {
+											...node.attrs,
+											class: null,
+											'data-prompt': null,
+											'data-suggestion': null
+										})
 								);
 								return true;
 							}
@@ -202,7 +211,7 @@ export const AIAutocompletion = Extension.create({
 							handleAICompletion(view);
 							return false;
 						},
-						touchstart: (view, event) => {
+						touchstart: (_view, event) => {
 							touchStartX = event.touches[0].clientX;
 							touchStartY = event.touches[0].clientY;
 							return false;
@@ -221,15 +230,20 @@ export const AIAutocompletion = Extension.create({
 								const { $head } = selection;
 								const node = $head.parent;
 
-								if (node.type.name === 'paragraph' && node.attrs['data-suggestion']) {
+								if (
+									node.type.name === 'paragraph' &&
+									node.attrs['data-suggestion']
+								) {
 									const suggestion = node.attrs['data-suggestion'];
 									dispatch(
-										state.tr.insertText(suggestion, $head.pos).setNodeMarkup($head.before(), null, {
-											...node.attrs,
-											class: null,
-											'data-prompt': null,
-											'data-suggestion': null
-										})
+										state.tr
+											.insertText(suggestion, $head.pos)
+											.setNodeMarkup($head.before(), null, {
+												...node.attrs,
+												class: null,
+												'data-prompt': null,
+												'data-suggestion': null
+											})
 									);
 									return true;
 								}
@@ -264,7 +278,7 @@ export const AIAutocompletion = Extension.create({
 
 						// 	return false;
 						// }
-						mouseup: (view, event) => {
+						mouseup: (view, _event) => {
 							const { state, dispatch } = view;
 
 							// Reset debounce timer on mouse click
@@ -273,7 +287,10 @@ export const AIAutocompletion = Extension.create({
 							// Iterate over all nodes in the document
 							const tr = state.tr;
 							state.doc.descendants((node, pos) => {
-								if (node.type.name === 'paragraph' && node.attrs['data-suggestion']) {
+								if (
+									node.type.name === 'paragraph' &&
+									node.attrs['data-suggestion']
+								) {
 									// Remove suggestion from this paragraph
 									tr.setNodeMarkup(pos, null, {
 										...node.attrs,

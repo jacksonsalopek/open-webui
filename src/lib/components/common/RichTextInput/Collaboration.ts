@@ -40,7 +40,6 @@ export class SocketIOCollaborationProvider {
 	private readonly doc = new Y.Doc();
 	private readonly awareness = new SimpleAwareness(this.doc);
 	private isConnected = false;
-	private synced = false;
 	private editor: Editor | null = null;
 	private editorContentGetter: EditorContentGetter | null = null;
 
@@ -71,7 +70,7 @@ export class SocketIOCollaborationProvider {
 					})
 				];
 
-				// @ts-ignore
+				// @ts-expect-error
 				plugins.push(yCursorPlugin(this.awareness));
 
 				return plugins;
@@ -143,7 +142,10 @@ export class SocketIOCollaborationProvider {
 											this.initialContent
 										);
 										if (editorYdoc) {
-											Y.applyUpdate(this.doc, Y.encodeStateAsUpdate(editorYdoc));
+											Y.applyUpdate(
+												this.doc,
+												Y.encodeStateAsUpdate(editorYdoc)
+											);
 										}
 									}
 								}
@@ -216,7 +218,11 @@ export class SocketIOCollaborationProvider {
 		this.awareness.on(
 			'change',
 			(
-				{ added, updated, removed }: { added: number[]; updated: number[]; removed: number[] },
+				{
+					added,
+					updated,
+					removed
+				}: { added: number[]; updated: number[]; removed: number[] },
 				origin: string
 			) => {
 				if (origin !== 'server' && this.isConnected) {
@@ -328,7 +334,10 @@ class SimpleAwareness {
 				this._states.set(+k, v);
 			}
 			for (const cb of this._updateHandlers) {
-				cb({ added: [], updated: Array.from(Object.keys(obj)).map(Number), removed: [] }, origin);
+				cb(
+					{ added: [], updated: Array.from(Object.keys(obj)).map(Number), removed: [] },
+					origin
+				);
 			}
 		} catch (e) {
 			console.warn('SimpleAwareness: Could not decode update:', e);

@@ -36,7 +36,7 @@ export class PyodideKernel {
 	}
 
 	async execute(id: string, code: string): Promise<CellState> {
-		return new Promise((resolve, reject) => {
+		return new Promise((resolve, _reject) => {
 			// Set up the listener for streaming and execution result
 			const state: CellState = {
 				id,

@@ -1687,6 +1687,25 @@ KAGI_SEARCH_API_KEY = ConfigVar(
     os.getenv('KAGI_SEARCH_API_KEY', ''),
 )
 
+# Auto-routing of Kagi saved/built-in lenses based on a YAML rule file. When
+# enabled, queries with a configured bang prefix or matching keyword get a
+# ``lens_id`` attached to the Kagi search call before it goes out — saved
+# lenses scope the search to their curated domain set.
+ENABLE_KAGI_LENS_ROUTING = ConfigVar(
+    'ENABLE_KAGI_LENS_ROUTING',
+    'rag.web.search.kagi_lens_routing.enable',
+    os.getenv('ENABLE_KAGI_LENS_ROUTING', 'True').lower() == 'true',
+)
+
+# Path to the YAML rule file. Default lives under the open-webui data volume
+# so it survives container recreation; bind-mount it from the host if you
+# want to edit it directly. Missing file = routing silently disabled.
+KAGI_LENSES_CONFIG_PATH = ConfigVar(
+    'KAGI_LENSES_CONFIG_PATH',
+    'rag.web.search.kagi_lens_routing.config_path',
+    os.getenv('KAGI_LENSES_CONFIG_PATH', '/app/backend/data/kagi_lenses.yaml'),
+)
+
 MOJEEK_SEARCH_API_KEY = ConfigVar(
     'MOJEEK_SEARCH_API_KEY',
     'rag.web.search.mojeek_search_api_key',
@@ -3217,6 +3236,76 @@ ENABLE_TITLE_GENERATION = ConfigVar(
     'ENABLE_TITLE_GENERATION',
     'task.title.enable',
     os.getenv('ENABLE_TITLE_GENERATION', 'True').lower() == 'true',
+)
+
+
+# Auto memory extraction: distill durable facts about the user from each turn
+# and persist them as memories. Off by default — only Title/Follow-up/Tags run
+# automatically out of the box; auto-memory adds an extra task-model call per
+# turn, so admins opt in.
+ENABLE_AUTO_MEMORY_EXTRACTION = ConfigVar(
+    'ENABLE_AUTO_MEMORY_EXTRACTION',
+    'task.memory_extraction.enable',
+    os.getenv('ENABLE_AUTO_MEMORY_EXTRACTION', 'False').lower() == 'true',
+)
+
+AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE = ConfigVar(
+    'AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE',
+    'task.memory_extraction.prompt_template',
+    os.getenv('AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE', ''),
+)
+
+DEFAULT_AUTO_MEMORY_EXTRACTION_PROMPT_TEMPLATE = """### Task:
+Read the latest exchange between the user and the assistant. Extract any durable, long-term facts the user revealed about themselves that would be useful to remember in **future, unrelated** conversations.
+
+### What counts as a memory:
+- Stable preferences (favorite tools, languages, frameworks, formats, communication style)
+- Identity / context (role, location, team, equipment, project they own)
+- Long-running goals or constraints (allergies, hardware limits, recurring deadlines)
+- Explicit "remember this" / "for future reference" / "save this" requests
+
+### What does NOT count:
+- Anything the assistant said about itself
+- Single-turn task details, ad-hoc questions, or things scoped to *this* chat
+- Speculation or facts the user is asking *about* (vs. stating *about themselves*)
+- Information already implied by another memory in <existing_memories> below
+- Empty / conversational filler ("ok", "thanks", greetings)
+
+### Guidelines:
+- Each memory must be a single self-contained sentence, written in third person about the user (e.g. "Prefers TypeScript over JavaScript.").
+- Prefer general, reusable phrasing over chat-specific details.
+- If the user contradicts an existing memory, emit the corrected version as a new memory — do not echo the old one.
+- If nothing qualifies, return an empty list. Returning nothing is the right answer most of the time.
+- Output **only** the raw JSON object, no prose, no markdown fences.
+
+### Output:
+JSON format: { "memories": ["fact 1", "fact 2"] }
+
+### Existing memories (do not duplicate):
+<existing_memories>
+{{EXISTING_MEMORIES}}
+</existing_memories>
+
+### Latest exchange:
+<chat_history>
+{{MESSAGES:END:2}}
+</chat_history>"""
+
+# Cosine-similarity floor (0–1) above which an extracted fact is treated as a
+# duplicate of an existing memory and skipped. Higher = stricter dedup. The
+# vector-DB search returns *similarity* (already 0–1, higher is better).
+AUTO_MEMORY_EXTRACTION_DEDUP_THRESHOLD = ConfigVar(
+    'AUTO_MEMORY_EXTRACTION_DEDUP_THRESHOLD',
+    'task.memory_extraction.dedup_threshold',
+    float(os.getenv('AUTO_MEMORY_EXTRACTION_DEDUP_THRESHOLD', '0.85')),
+)
+
+# Skip extraction when the user message is shorter than this (chars). Avoids
+# a wasted task-model call on greetings / one-word follow-ups.
+AUTO_MEMORY_EXTRACTION_MIN_USER_CHARS = ConfigVar(
+    'AUTO_MEMORY_EXTRACTION_MIN_USER_CHARS',
+    'task.memory_extraction.min_user_chars',
+    int(os.getenv('AUTO_MEMORY_EXTRACTION_MIN_USER_CHARS', '20')),
 )
 
 

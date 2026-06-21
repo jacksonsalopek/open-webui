@@ -271,7 +271,7 @@
 		const containerElement = document.getElementById('admin-settings-tabs-container');
 
 		if (containerElement) {
-			containerElement.addEventListener('wheel', function (event) {
+			containerElement.addEventListener('wheel', (event) => {
 				if (event.deltaY !== 0) {
 					// Adjust horizontal scroll position based on vertical scroll
 					containerElement.scrollLeft += event.deltaY;

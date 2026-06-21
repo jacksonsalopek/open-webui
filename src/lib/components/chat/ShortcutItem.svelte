@@ -31,7 +31,7 @@
 		}
 
 		// Next, try to use the layout map with the raw KeyboardEvent.code (e.g., "Slash")
-		if (keyboardLayoutMap && keyboardLayoutMap.has(key)) {
+		if (keyboardLayoutMap?.has(key)) {
 			const mappedKey = keyboardLayoutMap.get(key) ?? key;
 			// For single characters, make them uppercase. For others (like 'CapsLock'), leave as is.
 			return mappedKey.length === 1 ? mappedKey.toUpperCase() : mappedKey;

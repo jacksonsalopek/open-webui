@@ -47,7 +47,7 @@
 				minSize = Math.floor(percentage);
 
 				if (show) {
-					if (pane && pane.isExpanded() && pane.getSize() < minSize) {
+					if (pane?.isExpanded() && pane.getSize() < minSize) {
 						pane.resize(minSize);
 					}
 				}

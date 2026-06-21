@@ -101,7 +101,7 @@ export const getModels = async (
 										.then((res) => {
 											return res;
 										})
-										.catch((err) => {
+										.catch((_err) => {
 											return {
 												object: 'list',
 												data: [],
@@ -132,7 +132,11 @@ export const getModels = async (
 				const apiConfig = OPENAI_API_CONFIGS[idx.toString()] ?? {};
 
 				let models = Array.isArray(response) ? response : (response?.data ?? []);
-				models = models.map((model) => ({ ...model, openai: { id: model.id }, urlIdx: idx }));
+				models = models.map((model) => ({
+					...model,
+					openai: { id: model.id },
+					urlIdx: idx
+				}));
 
 				const prefixId = apiConfig.prefix_id;
 				if (prefixId) {
@@ -324,14 +328,17 @@ export const stopTask = async (token: string, id: string) => {
 export const stopTasksByChatId = async (token: string, chat_id: string) => {
 	let error = null;
 
-	const res = await fetch(`${WEBUI_BASE_URL}/api/tasks/chat/${encodeURIComponent(chat_id)}/stop`, {
-		method: 'POST',
-		headers: {
-			Accept: 'application/json',
-			'Content-Type': 'application/json',
-			...(token && { authorization: `Bearer ${token}` })
+	const res = await fetch(
+		`${WEBUI_BASE_URL}/api/tasks/chat/${encodeURIComponent(chat_id)}/stop`,
+		{
+			method: 'POST',
+			headers: {
+				Accept: 'application/json',
+				'Content-Type': 'application/json',
+				...(token && { authorization: `Bearer ${token}` })
+			}
 		}
-	})
+	)
 		.then(async (res) => {
 			if (!res.ok) throw await res.json();
 			return res.json();
@@ -463,7 +470,7 @@ export const getToolServersData = async (servers: object[]) => {
 					} else if ((specType === 'json' && server?.spec) ?? null) {
 						try {
 							res = JSON.parse(server?.spec);
-						} catch (e) {
+						} catch (_e) {
 							error = 'Failed to parse JSON spec';
 						}
 					}
@@ -514,7 +521,7 @@ export const getToolServersData = async (servers: object[]) => {
 									}
 								}
 							}
-						} catch (e) {
+						} catch (_e) {
 							// Server doesn't support /system — that's fine
 						}
 
@@ -622,8 +629,8 @@ export const executeToolServer = async (
 		}
 
 		// Handle requestBody composite
-		if (operation.requestBody && operation.requestBody.content) {
-			const contentType = Object.keys(operation.requestBody.content)[0];
+		if (operation.requestBody?.content) {
+			const _contentType = Object.keys(operation.requestBody.content)[0];
 			if (params !== undefined) {
 				bodyParams = params;
 			} else {
@@ -807,7 +814,7 @@ export const generateTitle = async (
 			const parsed = JSON.parse(jsonResponse);
 
 			// Step 6: If there's a "tags" key, return the tags array; otherwise, return an empty array
-			if (parsed && parsed.title) {
+			if (parsed?.title) {
 				return parsed.title;
 			} else {
 				return null;
@@ -879,7 +886,7 @@ export const generateTags = async (
 			const parsed = JSON.parse(jsonResponse);
 
 			// Step 6: If there's a "tags" key, return the tags array; otherwise, return an empty array
-			if (parsed && parsed.tags) {
+			if (parsed?.tags) {
 				return Array.isArray(parsed.tags) ? parsed.tags : [];
 			} else {
 				return [];
@@ -998,7 +1005,7 @@ export const generateQueries = async (
 			const parsed = JSON.parse(jsonResponse);
 
 			// Step 6: If there's a "queries" key, return the queries array; otherwise, return an empty array
-			if (parsed && parsed.queries) {
+			if (parsed?.queries) {
 				return Array.isArray(parsed.queries) ? parsed.queries : [];
 			} else {
 				return [];
@@ -1071,7 +1078,7 @@ export const generateAutoCompletion = async (
 			const parsed = JSON.parse(jsonResponse);
 
 			// Step 6: If there's a "queries" key, return the queries array; otherwise, return an empty array
-			if (parsed && parsed.text) {
+			if (parsed?.text) {
 				return parsed.text;
 			} else {
 				return '';

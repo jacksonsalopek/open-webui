@@ -182,7 +182,7 @@
 		}, {});
 
 		groupedMessageIdsIdx = parentMessage?.models.reduce((a, model, modelIdx) => {
-			const idx = groupedMessageIds[modelIdx].messageIds.findIndex((id) => id === messageId);
+			const idx = groupedMessageIds[modelIdx].messageIds.indexOf(messageId);
 			if (idx !== -1) {
 				return {
 					...a,
@@ -204,7 +204,7 @@
 	};
 
 	const onGroupClick = async (_messageId, modelIdx) => {
-		if (messageId != _messageId) {
+		if (messageId !== _messageId) {
 			let currentMessageId = _messageId;
 			let messageChildrenIds = history.messages[currentMessageId].childrenIds;
 			while (messageChildrenIds.length !== 0) {

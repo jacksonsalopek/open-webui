@@ -24,7 +24,7 @@
 						<!-- $i18n.t('Searched {{count}} sites') -->
 						{#if status?.description?.includes('{{count}}')}
 							{$i18n.t(status?.description, {
-								count: (status?.urls || status?.items).length
+								count: (status?.urls || status?.items)?.length ?? 0
 							})}
 						{:else if status?.description === 'No search query generated'}
 							{$i18n.t('No search query generated')}

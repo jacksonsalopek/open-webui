@@ -7,8 +7,9 @@ import mimetypes
 import os
 import re
 import shutil
+import time
 import uuid
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Sequence, Union
 
@@ -78,12 +79,14 @@ from open_webui.retrieval.vector.utils import filter_metadata
 # Web search: Kagi is the only supported engine in this fork. Other providers
 # were stripped to keep the surface area (and config sprawl) minimal.
 from open_webui.retrieval.web.kagi import search_kagi
+from open_webui.retrieval.web.kagi_lenses import route_query as route_kagi_lens
 from open_webui.retrieval.web.main import SearchResult
 from open_webui.retrieval.web.nl_filter import (
     WebSearchFilter,
     extract_filter_from_query,
     has_full_native_support,
 )
+from open_webui.retrieval.web import page_cache
 from open_webui.retrieval.web.utils import get_web_loader
 from open_webui.storage.provider import Storage
 from open_webui.utils.access_control import has_permission
@@ -1711,15 +1714,92 @@ async def search_web(
 ) -> list[SearchResult]:
     """Run a web search, applying natural-language filters where possible.
 
-    A natural-language filter is parsed from the query (see ``nl_filter``). Its
-    native params are passed to providers that support them (e.g. Kagi); any
-    remaining domain/keyword constraints are applied to the returned results.
-    Parsing fails open, so search behaves normally if filtering is unavailable.
+    Pipeline (Kagi):
+
+    1. Lens routing — the configured Kagi lens YAML is checked for bang
+       prefixes (``!reddit``) and keyword triggers; the first match yields a
+       ``lens_id`` and a (potentially cleaned) query.
+    2. Natural-language filter — :func:`extract_filter_from_query` parses
+       date/region/domain/keyword intent from the (cleaned) query.
+    3. Dispatch — both the lens and the NL filter are forwarded to
+       :func:`search_kagi`. A routed lens takes precedence over any inline
+       lens the NL filter would have built.
+
+    Each layer fails open: a missing lens config, a downed NL-filter model,
+    or a parse error all degrade gracefully to a plain search.
     """
-    search_filter = await asyncio.to_thread(extract_filter_from_query, query)
+    lens_id: Optional[str] = None
+    lens_name: Optional[str] = None
+    effective_query = query
+    if engine == 'kagi' and getattr(
+        request.app.state.config, 'ENABLE_KAGI_LENS_ROUTING', True
+    ):
+        try:
+            lens_id, effective_query, lens_name = await asyncio.to_thread(
+                route_kagi_lens,
+                query,
+                config_path=getattr(
+                    request.app.state.config, 'KAGI_LENSES_CONFIG_PATH', None
+                ),
+            )
+        except Exception as e:  # never let lens routing break search
+            log.debug('search_web: kagi lens routing failed: %s', e)
+            lens_id = None
+            effective_query = query
+            lens_name = None
+
+        if lens_id:
+            log.debug(
+                "search_web: kagi lens routed query=%r → lens=%s (%s); cleaned=%r",
+                query,
+                lens_id,
+                lens_name,
+                effective_query,
+            )
+
+    search_filter = await asyncio.to_thread(extract_filter_from_query, effective_query)
+
+    # Recency-intent → shorter page-cache TTL. The NL filter sets ``after``
+    # to ~30d before today for "recent/latest/news" queries and ~1-2d for
+    # "breaking news". We treat any ``after`` within ~31 days of today as
+    # recency intent and surface that to ``process_web_search`` via the
+    # request scope so the loader downstream can opt into a shorter cache
+    # TTL. Done at request scope (not contextvar) so multiple concurrent
+    # sub-query tasks under ``asyncio.gather`` can all contribute.
+    try:
+        if (
+            search_filter is not None
+            and search_filter.after is not None
+            and (date.today() - search_filter.after).days <= 31
+        ):
+            request.state.web_page_cache_recency_hint = True
+    except Exception:  # defensive: never fail a search over a cache hint
+        pass
+
+    # Surface what the NL parser produced so "LLM said empty" vs "LLM call
+    # failed" is visible without cross-referencing nl_filter's own debug logs.
+    if search_filter is not None and not search_filter.is_empty():
+        log.debug(
+            "search_web: parsed nl filter for query=%r engine=%s -> %s",
+            effective_query,
+            engine,
+            search_filter.model_dump(exclude_none=True, exclude_defaults=True),
+        )
+    else:
+        log.debug(
+            "search_web: no nl filter applied for query=%r engine=%s "
+            "(parser returned empty or failed open)",
+            effective_query,
+            engine,
+        )
 
     results = await _dispatch_web_search(
-        request, engine, query, user=user, search_filter=search_filter
+        request,
+        engine,
+        effective_query,
+        user=user,
+        search_filter=search_filter,
+        lens_id=lens_id,
     )
 
     # Providers with full native support already applied the filter at the
@@ -1740,6 +1820,7 @@ async def _dispatch_web_search(
     query: str,
     user=None,
     search_filter: Optional[WebSearchFilter] = None,
+    lens_id: Optional[str] = None,
 ) -> list[SearchResult]:
     """Dispatch a web search query to the configured engine and return results.
 
@@ -1758,6 +1839,7 @@ async def _dispatch_web_search(
             request.app.state.config.WEB_SEARCH_RESULT_COUNT,
             request.app.state.config.WEB_SEARCH_DOMAIN_FILTER_LIST,
             search_filter,
+            lens_id,
         )
 
     # This fork only supports Kagi; legacy engines are intentionally unsupported.
@@ -1780,11 +1862,36 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
             detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
         )
 
+    # Per-stage stopwatch for the web-search pipeline. One structured line
+    # lands in the logs per call so we can answer "where did the seconds
+    # go" without grepping across services. Stages roughly match the
+    # control flow below: search = Kagi fan-out (incl. NL filter LLM
+    # calls), load = Playwright fetch of every URL, embed = MLX embedding
+    # + vector-db write. Numbers are wall-clock ms.
+    t_pipeline_start = time.perf_counter()
+    stage_ms: dict[str, float] = {}
+
+    def _mark(stage: str, t0: float) -> None:
+        stage_ms[stage] = round((time.perf_counter() - t0) * 1000, 1)
+
+    def _emit_timing(outcome: str, **extra) -> None:
+        total_ms = round((time.perf_counter() - t_pipeline_start) * 1000, 1)
+        log.info(
+            'web_search_timing outcome=%s engine=%s n_queries=%d total_ms=%.1f stages=%s extra=%s',
+            outcome,
+            request.app.state.config.WEB_SEARCH_ENGINE,
+            len(form_data.queries or []),
+            total_ms,
+            stage_ms,
+            extra,
+        )
+
     urls = []
     result_items = []
 
     try:
         logging.debug(f'trying to web search with {request.app.state.config.WEB_SEARCH_ENGINE, form_data.queries}')
+        t_search = time.perf_counter()
 
         # Use semaphore to limit concurrent requests based on WEB_SEARCH_CONCURRENT_REQUESTS
         # 0 or None = unlimited (previous behavior), positive number = limited concurrency
@@ -1817,9 +1924,29 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 for query in form_data.queries
             ]
 
-        search_results = await asyncio.gather(*search_tasks)
+        # ``return_exceptions=True`` so one rejected sub-query (Kagi 400 on a
+        # bad lens, transient 5xx, rate limit, etc.) doesn't tank the entire
+        # chat turn. Without this, the first failing query's exception
+        # propagates out of ``gather`` and the user sees "An error occurred
+        # while searching the web" even when 2/3 sibling queries had
+        # perfectly good results. Observed on a "Kentucky" prompt where the
+        # NL filter inferred ``region: US`` on every sub-query and Kagi
+        # 400'd all three uniformly -- but the same pattern would have hit
+        # the user even if only one of three queries had been malformed.
+        search_results_raw = await asyncio.gather(*search_tasks, return_exceptions=True)
+        _mark('search', t_search)
 
-        for result in search_results:
+        search_results = []
+        search_errors: list[str] = []
+        for query, result in zip(form_data.queries, search_results_raw):
+            if isinstance(result, BaseException):
+                log.warning(
+                    'search_web: sub-query failed query=%r err=%s: %s',
+                    query, type(result).__name__, result,
+                )
+                search_errors.append(f'{query!r}: {result}')
+                continue
+            search_results.append(result)
             if result:
                 for item in result:
                     if item and item.link:
@@ -1829,11 +1956,29 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
         urls = list(dict.fromkeys(urls))
         log.debug(f'urls: {urls}')
 
+        # Only abort the turn if EVERY sub-query failed. If at least one
+        # came back with results, proceed with what we have and report
+        # the failures structurally so they show up in web_search_timing
+        # without poisoning the chat reply.
+        if search_errors and not search_results:
+            raise Exception(
+                'all '
+                f'{len(form_data.queries)} sub-queries failed: '
+                + ' | '.join(search_errors)
+            )
+        if search_errors:
+            log.info(
+                'search_web: %d/%d sub-queries failed but %d succeeded; proceeding',
+                len(search_errors), len(form_data.queries), len(search_results),
+            )
+
     except Exception as e:
         log.exception('Web search failed')
+        _emit_timing('error_search', error=str(e))
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.WEB_SEARCH_ERROR(e))
 
     if len(urls) == 0:
+        _emit_timing('no_results')
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail=ERROR_MESSAGES.DEFAULT('No results found from web search'),
@@ -1857,13 +2002,28 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 if hasattr(result, 'snippet') and result.snippet is not None
             ]
         else:
+            # If ANY sub-query in this batch surfaced a recency-intent hint
+            # (NL filter parsed ``after=`` within ~31 days of today), use the
+            # shorter recency TTL for the whole batch. Mixing TTLs per-URL
+            # would be possible but a single batch-wide TTL is plenty for the
+            # heuristic and keeps the cache plumbing trivial.
+            cache_ttl_override = None
+            if getattr(request.state, 'web_page_cache_recency_hint', False):
+                cache_ttl_override = page_cache.recency_ttl_seconds()
+                log.debug(
+                    'process_web_search: recency intent detected, page cache TTL=%ss',
+                    cache_ttl_override,
+                )
             loader = get_web_loader(
                 urls,
                 verify_ssl=request.app.state.config.ENABLE_WEB_LOADER_SSL_VERIFICATION,
                 requests_per_second=request.app.state.config.WEB_LOADER_CONCURRENT_REQUESTS,
                 trust_env=request.app.state.config.WEB_SEARCH_TRUST_ENV,
+                cache_ttl_seconds=cache_ttl_override,
             )
+            t_load = time.perf_counter()
             docs = await loader.aload()
+            _mark('load', t_load)
 
         urls = [
             doc.metadata.get('source') for doc in docs if doc.metadata.get('source')
@@ -1873,6 +2033,7 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
         ]  # only keep the search results that have been loaded
 
         if request.app.state.config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
+            _emit_timing('ok_bypass_embed', n_docs=len(docs), n_urls=len(urls))
             return {
                 'status': True,
                 'collection_name': None,
@@ -1891,6 +2052,7 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
             # Create a single collection for all documents
             collection_name = f'web-search-{calculate_sha256_string("-".join(form_data.queries))}'[:63]
 
+            t_embed = time.perf_counter()
             try:
                 await run_in_threadpool(
                     save_docs_to_vector_db,
@@ -1902,7 +2064,9 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                 )
             except Exception as e:
                 log.debug(f'error saving docs: {e}')
+            _mark('embed', t_embed)
 
+            _emit_timing('ok', n_docs=len(docs), n_urls=len(urls))
             return {
                 'status': True,
                 'collection_names': [collection_name],
@@ -1912,6 +2076,7 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
             }
     except Exception as e:
         log.exception('Web search content loading failed')
+        _emit_timing('error_load_or_embed', error=str(e))
         raise HTTPException(status.HTTP_400_BAD_REQUEST, detail=ERROR_MESSAGES.DEFAULT(e))
 
 

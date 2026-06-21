@@ -48,7 +48,7 @@
 		const regExp = new RegExp(regExpStr);
 		const matches = token.text?.match(regExp);
 
-		if (matches && matches.length) {
+		if (matches?.length) {
 			const alertType = matches[1] as AlertType;
 			const newText = token.text.replace(regExp, '');
 			const newTokens = marked.lexer(newText);

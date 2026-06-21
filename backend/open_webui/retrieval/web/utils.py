@@ -50,6 +50,7 @@ from open_webui.env import AIOHTTP_CLIENT_ALLOW_REDIRECTS, AIOHTTP_CLIENT_SESSIO
 from open_webui.retrieval.loaders.external_web import ExternalWebLoader
 from open_webui.retrieval.loaders.tavily import TavilyLoader
 from open_webui.retrieval.web.firecrawl import scrape_firecrawl_url
+from open_webui.retrieval.web import page_cache
 from open_webui.utils.misc import is_string_allowed
 
 log = logging.getLogger(__name__)
@@ -486,8 +487,15 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         proxy: Optional[Dict[str, str]] = None,
         playwright_ws_url: Optional[str] = None,
         playwright_timeout: Optional[int] = 10000,
+        cache_ttl_seconds: Optional[int] = None,
     ):
-        """Initialize with additional safety parameters and remote browser support."""
+        """Initialize with additional safety parameters and remote browser support.
+
+        ``cache_ttl_seconds`` overrides the env-configured page-cache TTL for
+        this loader instance. ``None`` means "use the cache module default"
+        (typically 6h). A non-positive value disables the cache entirely for
+        this batch -- useful for callers that want a forced refresh.
+        """
 
         proxy_server = proxy.get('server') if proxy else None
         if trust_env and not proxy_server:
@@ -513,6 +521,7 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         self.playwright_ws_url = playwright_ws_url
         self.trust_env = trust_env
         self.playwright_timeout = playwright_timeout
+        self.cache_ttl_seconds = cache_ttl_seconds
 
     def _intercept_navigation_sync(self, route, request=None):
         req = request or route.request
@@ -543,32 +552,55 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
         route.fulfill(response=resp)
 
     async def _intercept_navigation(self, route, request=None):
+        # Late route events for already-closed pages are normal under
+        # Playwright: any in-flight subresource (trackers, deferred fetches,
+        # late analytics beacons) can fire its route hook AFTER the parent
+        # `page.goto()` has already returned and the page has been closed in
+        # the alazy_load `finally` block. When that happens, every Playwright
+        # call on `route` raises `TargetClosedError: ... Target page, context
+        # or browser has been closed`. The right behavior is to drop those
+        # late events silently — the request was going to be cancelled with
+        # the page anyway. Letting the exception escape causes alazy_load to
+        # tag the entire batch as fatally dead and abort all remaining URLs.
+        async def _safe_route_call(coro_factory):
+            try:
+                return await coro_factory()
+            except Exception:
+                return None
+
         req = request or route.request
 
         if req.resource_type != 'document':
-            await route.continue_()
+            await _safe_route_call(route.continue_)
             return
 
         try:
             await run_in_threadpool(validate_url, req.url)
         except Exception:
-            await route.abort()
+            await _safe_route_call(route.abort)
             return
 
-        if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
-            resp = await route.fetch()
-        else:
-            try:
-                resp = await route.fetch(max_redirects=0)
-            except TypeError:
-                await route.abort()
-                return
+        try:
+            if AIOHTTP_CLIENT_ALLOW_REDIRECTS:
+                resp = await route.fetch()
+            else:
+                try:
+                    resp = await route.fetch(max_redirects=0)
+                except TypeError:
+                    await _safe_route_call(route.abort)
+                    return
 
-            if 300 <= resp.status < 400:
-                await route.abort()
-                return
+                if 300 <= resp.status < 400:
+                    await _safe_route_call(route.abort)
+                    return
 
-        await route.fulfill(response=resp)
+            await route.fulfill(response=resp)
+        except Exception:
+            # Page closed mid-fetch / mid-fulfill. The browser is still
+            # alive; the rest of alazy_load can keep going with the next
+            # URL. Swallowing here is what prevents one slow tracker from
+            # poisoning the whole batch.
+            return
 
     def lazy_load(self) -> Iterator[Document]:
         """Safely load URLs synchronously with support for remote browser."""
@@ -605,82 +637,188 @@ class SafePlaywrightURLLoader(PlaywrightURLLoader, RateLimitMixin, URLProcessing
             browser.close()
 
     async def alazy_load(self) -> AsyncIterator[Document]:
-        """Safely load URLs asynchronously with support for remote browser."""
+        """Safely load URLs asynchronously with support for remote browser.
+
+        Loads URLs concurrently inside a single browser connection. Each URL
+        runs in its own ``BrowserContext`` so that misbehaving pages cannot
+        leak route handlers, cookies, or storage onto siblings -- a behavior
+        we directly observed previously where one slow tracker request from
+        ``vimm.net`` raised ``TargetClosedError`` and poisoned the entire
+        batch under the old sequential ``new_page()``-per-URL implementation.
+
+        Concurrency is bounded by ``self.requests_per_second`` (sourced from
+        ``WEB_LOADER_CONCURRENT_REQUESTS``; the upstream env var is poorly
+        named but its INTENT was always "max parallel URL fetches" -- we
+        finally honor that here). Documents are collected via
+        ``asyncio.gather`` and then yielded in URL-input order so downstream
+        consumers (citations UI, etc.) see deterministic ordering.
+        """
         from playwright.async_api import async_playwright
+
+        # Phase 1 page cache: short-circuit URLs we've already fetched recently.
+        # Cached docs are held aside and yielded at the end in original URL
+        # order alongside freshly-loaded ones, so downstream consumers (the
+        # citations UI) see the same deterministic ordering as before.
+        cache_ttl = self.cache_ttl_seconds
+        cached_docs: Dict[str, Document] = {}
+        if page_cache.is_enabled() and (cache_ttl is None or cache_ttl > 0):
+            for url in self.urls:
+                content = page_cache.get(url, cache_ttl)
+                if content is not None:
+                    cached_docs[url] = Document(
+                        page_content=content,
+                        metadata={'source': url, 'cache_hit': True},
+                    )
+            if cached_docs:
+                log.info(
+                    'page_cache: serving %d/%d URLs from cache (ttl=%ss)',
+                    len(cached_docs),
+                    len(self.urls),
+                    cache_ttl if cache_ttl is not None else page_cache.default_ttl_seconds(),
+                )
+
+        uncached_urls = [u for u in self.urls if u not in cached_docs]
+
+        # All hits -- skip launching Playwright entirely.
+        if not uncached_urls:
+            for url in self.urls:
+                doc = cached_docs.get(url)
+                if doc is not None:
+                    yield doc
+            return
 
         # Connection-level failures from the remote browser ("socket hang up",
         # closed/disconnected target, etc.) leave the `browser` handle pointing
         # at a corpse — every subsequent operation queues RPCs against a session
         # that no longer exists, and the final `browser.close()` /
         # async_playwright `__aexit__` block forever waiting for them. Detect
-        # those errors and bail out of the loop early.
+        # those errors and skip remaining tasks early.
+        #
+        # Deliberately NOT in this list: "target page, context or browser has
+        # been closed" — that string is what Playwright raises from inside our
+        # `_intercept_navigation` route handler when a late subresource event
+        # fires after a `page.goto()` has already finished and the page has
+        # been closed (which is normal under Playwright). Treating it as a
+        # browser-level fatal was poisoning whole batches over a single late
+        # tracker request. "target closed" alone (without "page, context or
+        # browser ... closed") is genuinely browser death and stays in.
         FATAL_BROWSER_ERROR_MARKERS = (
             'socket hang up',
             'browser has disconnected',
             'browser closed',
             'connection closed',
             'target closed',
-            'target page, context or browser has been closed',
             'session with given id not found',
         )
 
+        # Max URLs in flight at once. ``requests_per_second`` is the only
+        # tunable already wired to this class; we reuse it as the concurrency
+        # cap. Default 5 keeps memory bounded on the remote chromium even if
+        # a knowledge-base ingestion ever hands us hundreds of URLs at once.
+        max_concurrent = max(1, int(self.requests_per_second or 5))
+        semaphore = asyncio.Semaphore(max_concurrent)
+
         async with async_playwright() as p:
-            # Use remote browser if ws_endpoint is provided, otherwise use local browser
+            # Use remote browser if ws_endpoint is provided, otherwise local.
             if self.playwright_ws_url:
                 browser = await p.chromium.connect(self.playwright_ws_url)
             else:
                 browser = await p.chromium.launch(headless=self.headless, proxy=self.proxy)
 
-            browser_alive = True
+            # ``asyncio.Event`` is set by the first task to observe a fatal
+            # browser-level error. Tasks still pending will short-circuit
+            # without acquiring the semaphore.
+            browser_dead = asyncio.Event()
 
-            for url in self.urls:
-                if not browser_alive:
+            async def _load_one(url: str) -> Optional[Document]:
+                if browser_dead.is_set():
                     log.warning(
                         'Skipping %s: remote browser session is dead, no point '
                         'trying additional URLs in this batch',
                         url,
                     )
-                    continue
+                    return None
 
-                page = None
-                try:
-                    await self._safe_process_url(url)
-                    page = await browser.new_page()
-                    await page.route('**/*', self._intercept_navigation)
-                    response = await page.goto(
-                        url,
-                        timeout=self.playwright_timeout,
-                        wait_until='domcontentloaded',
-                    )
-                    if response is None:
-                        raise ValueError(f'page.goto() returned None for url {url}')
+                async with semaphore:
+                    if browser_dead.is_set():
+                        return None
 
-                    text = await self.evaluator.evaluate_async(page, browser, response)
-                    metadata = {'source': url}
-                    yield Document(page_content=text, metadata=metadata)
-                except Exception as e:
-                    err_msg = str(e).lower()
-                    is_fatal = any(m in err_msg for m in FATAL_BROWSER_ERROR_MARKERS)
-                    if is_fatal:
-                        browser_alive = False
-                        log.error(
-                            'Fatal Playwright connection error while loading %s; '
-                            'aborting remaining URLs in this batch: %s',
+                    context = None
+                    page = None
+                    try:
+                        await self._safe_process_url(url)
+                        # Context-per-URL is the isolation boundary that fixes
+                        # the "one bad tracker kills the batch" failure mode.
+                        # Route handlers, cookies, and any IndexedDB / SW
+                        # state are scoped to the context, so siblings can't
+                        # see each other's tear-down events.
+                        context = await browser.new_context()
+                        page = await context.new_page()
+                        await page.route('**/*', self._intercept_navigation)
+                        response = await page.goto(
                             url,
-                            e,
+                            timeout=self.playwright_timeout,
+                            wait_until='domcontentloaded',
                         )
-                    elif self.continue_on_failure:
-                        log.exception(f'Error loading {url}: {e}')
-                    else:
-                        raise
-                finally:
-                    if page is not None and browser_alive:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
+                        if response is None:
+                            raise ValueError(f'page.goto() returned None for url {url}')
 
-            if browser_alive:
+                        text = await self.evaluator.evaluate_async(page, browser, response)
+                        return Document(page_content=text, metadata={'source': url})
+                    except Exception as e:
+                        err_msg = str(e).lower()
+                        is_fatal = any(m in err_msg for m in FATAL_BROWSER_ERROR_MARKERS)
+                        if is_fatal:
+                            browser_dead.set()
+                            log.error(
+                                'Fatal Playwright connection error while loading %s; '
+                                'remaining URLs in this batch will be skipped: %s',
+                                url,
+                                e,
+                            )
+                        elif self.continue_on_failure:
+                            log.exception(f'Error loading {url}: {e}')
+                        else:
+                            raise
+                        return None
+                    finally:
+                        # Best-effort cleanup. Closing an already-closed
+                        # page/context raises; we deliberately ignore those.
+                        # Order matters: close the page before its context so
+                        # Playwright doesn't surface a redundant page-close
+                        # error during context teardown.
+                        for closeable in (page, context):
+                            if closeable is None:
+                                continue
+                            try:
+                                await closeable.close()
+                            except Exception:
+                                pass
+
+            results = await asyncio.gather(
+                *(_load_one(url) for url in uncached_urls),
+                return_exceptions=False,
+            )
+
+            loaded: Dict[str, Document] = {}
+            for url, doc in zip(uncached_urls, results):
+                if doc is None:
+                    continue
+                loaded[url] = doc
+                # Best-effort cache write; never let a cache failure break
+                # the search. ``put`` already swallows + DEBUG-logs, but the
+                # outer try keeps us defensive against import-time issues.
+                try:
+                    page_cache.put(url, doc.page_content)
+                except Exception as e:
+                    log.debug('page_cache: write failed for %s: %s', url, e)
+
+            for url in self.urls:
+                doc = cached_docs.get(url) or loaded.get(url)
+                if doc is not None:
+                    yield doc
+
+            if not browser_dead.is_set():
                 try:
                     await browser.close()
                 except Exception as e:
@@ -806,11 +944,250 @@ class SafeWebBaseLoader(WebBaseLoader):
         return [document async for document in self.alazy_load()]
 
 
+class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
+    """Pure-Python loader: aiohttp fetch + trafilatura content extraction.
+
+    Drop-in replacement for ``SafePlaywrightURLLoader`` for sites that don't
+    require JavaScript rendering. Trafilatura is dramatically faster (no
+    Chromium, no WebSocket round-trip, no per-URL browser context), strips
+    boilerplate (nav, footer, cookie banners, comment sections) the way
+    ``SafeWebBaseLoader``'s raw BS4 ``get_text()`` cannot, and emits clean
+    markdown that downstream RAG chunking can split on real semantic
+    boundaries.
+
+    Trade-off: trafilatura does not execute JavaScript. Single-page apps
+    that render their content client-side will come back with empty or
+    placeholder bodies. Most news sites, blogs, docs, GitHub, Wikipedia,
+    Stack Overflow, Hacker News, and old.reddit work fine; modern JS-only
+    app shells (X, Discord, etc.) do not. Keep ``SafePlaywrightURLLoader``
+    around for those.
+
+    Wires into the same infrastructure the rest of this module uses:
+
+    - ``_SSRFSafeResolver`` on the aiohttp connector + ``_SSRFSafeAdapter``
+      on the sync requests path so redirect-based SSRF is blocked.
+    - ``USER_AGENT`` so Cloudflare / Wikipedia / similar bot-detection
+      doesn't drop the request.
+    - ``AIOHTTP_CLIENT_ALLOW_REDIRECTS`` for the redirect policy.
+    - ``page_cache.get`` / ``page_cache.put`` for the same 6h on-disk
+      page cache the Playwright loader uses, so repeat searches don't
+      re-fetch.
+    - ``requests_per_second`` (sourced from ``WEB_LOADER_CONCURRENT_REQUESTS``)
+      as the asyncio semaphore cap, matching ``SafePlaywrightURLLoader``.
+    """
+
+    def __init__(
+        self,
+        web_paths: List[str],
+        verify_ssl: bool = True,
+        trust_env: bool = False,
+        requests_per_second: Optional[float] = None,
+        continue_on_failure: bool = True,
+        timeout: Optional[float] = 15.0,
+        output_format: Literal['markdown', 'txt', 'html'] = 'markdown',
+        cache_ttl_seconds: Optional[int] = None,
+    ):
+        self.web_paths = web_paths
+        self.verify_ssl = verify_ssl
+        self.trust_env = trust_env
+        self.requests_per_second = requests_per_second
+        self.last_request_time = None
+        self.continue_on_failure = continue_on_failure
+        self.timeout = timeout
+        self.output_format = output_format
+        self.cache_ttl_seconds = cache_ttl_seconds
+
+    @staticmethod
+    def _build_metadata(html: str, url: str) -> Dict[str, Any]:
+        """Best-effort trafilatura metadata extraction (title/author/date/desc)."""
+        metadata: Dict[str, Any] = {'source': url}
+        try:
+            import trafilatura
+
+            meta = trafilatura.extract_metadata(html)
+            if meta is None:
+                return metadata
+            if getattr(meta, 'title', None):
+                metadata['title'] = meta.title
+            if getattr(meta, 'author', None):
+                metadata['author'] = meta.author
+            if getattr(meta, 'date', None):
+                metadata['date'] = meta.date
+            if getattr(meta, 'description', None):
+                metadata['description'] = meta.description
+            if getattr(meta, 'sitename', None):
+                metadata['sitename'] = meta.sitename
+            if getattr(meta, 'language', None):
+                metadata['language'] = meta.language
+        except Exception as e:
+            log.debug(f'trafilatura: metadata extraction failed for {url}: {e}')
+        return metadata
+
+    def _extract(self, html: str, url: str) -> Optional[Document]:
+        """HTML → trafilatura → Document. Returns ``None`` on empty extraction."""
+        import trafilatura
+
+        try:
+            text = trafilatura.extract(
+                html,
+                url=url,
+                output_format=self.output_format,
+                # Strip noise. Comment sections are rarely worth ingesting and
+                # tank chunk quality with low-signal threads; tables are the
+                # opposite -- most docs/wiki pages put structured facts there.
+                include_comments=False,
+                include_tables=True,
+                # Bias toward keeping only confidently-main-content blocks.
+                # On RAG ingestion we'd rather lose a borderline paragraph
+                # than poison a chunk with navigation cruft.
+                favor_precision=True,
+                with_metadata=False,
+            )
+        except Exception as e:
+            log.warning(f'trafilatura: extract() failed for {url}: {e}')
+            return None
+
+        if not text or not text.strip():
+            log.debug(f'trafilatura: empty extraction for {url} (likely JS-rendered)')
+            return None
+
+        metadata = self._build_metadata(html, url)
+        return Document(page_content=text, metadata=metadata)
+
+    def lazy_load(self) -> Iterator[Document]:
+        """Synchronous fetch + extract path. Used by BaseLoader.load()."""
+        session = requests.Session()
+        if USER_AGENT:
+            session.headers['User-Agent'] = USER_AGENT
+        session.mount('http://', _SSRFSafeAdapter())
+        session.mount('https://', _SSRFSafeAdapter())
+
+        for url in self.web_paths:
+            try:
+                self._safe_process_url_sync(url)
+                resp = session.get(
+                    url,
+                    timeout=self.timeout,
+                    verify=self.verify_ssl,
+                    allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                )
+                resp.raise_for_status()
+                doc = self._extract(resp.text, url)
+                if doc is not None:
+                    yield doc
+                    try:
+                        page_cache.put(url, doc.page_content)
+                    except Exception as e:
+                        log.debug('page_cache: write failed for %s: %s', url, e)
+            except Exception as e:
+                if self.continue_on_failure:
+                    log.exception(f'Error loading {url}: {e}')
+                    continue
+                raise
+
+    async def alazy_load(self) -> AsyncIterator[Document]:
+        """Async concurrent fetch + extract. Order-preserving with page_cache."""
+        cache_ttl = self.cache_ttl_seconds
+        cached_docs: Dict[str, Document] = {}
+        if page_cache.is_enabled() and (cache_ttl is None or cache_ttl > 0):
+            for url in self.web_paths:
+                content = page_cache.get(url, cache_ttl)
+                if content is not None:
+                    cached_docs[url] = Document(
+                        page_content=content,
+                        metadata={'source': url, 'cache_hit': True},
+                    )
+            if cached_docs:
+                log.info(
+                    'page_cache: serving %d/%d URLs from cache (ttl=%ss)',
+                    len(cached_docs),
+                    len(self.web_paths),
+                    cache_ttl if cache_ttl is not None else page_cache.default_ttl_seconds(),
+                )
+
+        uncached_urls = [u for u in self.web_paths if u not in cached_docs]
+        if not uncached_urls:
+            for url in self.web_paths:
+                doc = cached_docs.get(url)
+                if doc is not None:
+                    yield doc
+            return
+
+        max_concurrent = max(1, int(self.requests_per_second or 5))
+        semaphore = asyncio.Semaphore(max_concurrent)
+
+        headers: Dict[str, str] = {}
+        if USER_AGENT:
+            headers['User-Agent'] = USER_AGENT
+
+        ssl_arg: Any = AIOHTTP_CLIENT_SESSION_SSL if self.verify_ssl else False
+        connector = aiohttp.TCPConnector(resolver=_SSRFSafeResolver())
+        client_timeout = aiohttp.ClientTimeout(total=self.timeout) if self.timeout else None
+
+        async def _fetch_and_extract(
+            session: aiohttp.ClientSession, url: str
+        ) -> Optional[Document]:
+            async with semaphore:
+                try:
+                    await self._safe_process_url(url)
+                    async with session.get(
+                        url,
+                        ssl=ssl_arg,
+                        allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                    ) as response:
+                        response.raise_for_status()
+                        html = await response.text()
+                except Exception as e:
+                    if self.continue_on_failure:
+                        log.warning(f'Error fetching {url}: {e}')
+                        return None
+                    raise
+
+                # Push the (CPU-bound) lxml parse off the event loop.
+                try:
+                    return await run_in_threadpool(self._extract, html, url)
+                except Exception as e:
+                    if self.continue_on_failure:
+                        log.exception(f'Error extracting {url}: {e}')
+                        return None
+                    raise
+
+        async with aiohttp.ClientSession(
+            trust_env=self.trust_env,
+            connector=connector,
+            headers=headers,
+            timeout=client_timeout,
+        ) as session:
+            results = await asyncio.gather(
+                *(_fetch_and_extract(session, url) for url in uncached_urls),
+                return_exceptions=False,
+            )
+
+        loaded: Dict[str, Document] = {}
+        for url, doc in zip(uncached_urls, results):
+            if doc is None:
+                continue
+            loaded[url] = doc
+            try:
+                page_cache.put(url, doc.page_content)
+            except Exception as e:
+                log.debug('page_cache: write failed for %s: %s', url, e)
+
+        for url in self.web_paths:
+            doc = cached_docs.get(url) or loaded.get(url)
+            if doc is not None:
+                yield doc
+
+    async def aload(self) -> list[Document]:
+        return [document async for document in self.alazy_load()]
+
+
 def get_web_loader(
     urls: Union[str, Sequence[str]],
     verify_ssl: bool = True,
     requests_per_second: int = 2,
     trust_env: bool = False,
+    cache_ttl_seconds: Optional[int] = None,
 ):
     # Check if the URLs are valid
     safe_urls = safe_validate_urls([urls] if isinstance(urls, str) else urls)
@@ -848,6 +1225,24 @@ def get_web_loader(
         web_loader_args['playwright_timeout'] = PLAYWRIGHT_TIMEOUT.value
         if PLAYWRIGHT_WS_URL.value:
             web_loader_args['playwright_ws_url'] = PLAYWRIGHT_WS_URL.value
+        # Page cache is honored by the engines that fetch the raw page
+        # bytes themselves (Playwright, trafilatura). Firecrawl / Tavily /
+        # external already proxy through their own caches and we don't
+        # want to second-guess their request semantics.
+        if cache_ttl_seconds is not None:
+            web_loader_args['cache_ttl_seconds'] = cache_ttl_seconds
+
+    if WEB_LOADER_ENGINE.value == 'trafilatura':
+        WebLoaderClass = SafeTrafilaturaLoader
+        if WEB_LOADER_TIMEOUT.value:
+            try:
+                timeout_value = float(WEB_LOADER_TIMEOUT.value)
+            except ValueError:
+                timeout_value = None
+            if timeout_value:
+                web_loader_args['timeout'] = timeout_value
+        if cache_ttl_seconds is not None:
+            web_loader_args['cache_ttl_seconds'] = cache_ttl_seconds
 
     if WEB_LOADER_ENGINE.value == 'firecrawl':
         WebLoaderClass = SafeFireCrawlLoader
@@ -882,5 +1277,6 @@ def get_web_loader(
     else:
         raise ValueError(
             f'Invalid WEB_LOADER_ENGINE: {WEB_LOADER_ENGINE.value}. '
-            "Please set it to 'safe_web', 'playwright', 'firecrawl', or 'tavily'."
+            "Please set it to 'safe_web', 'playwright', 'trafilatura', "
+            "'firecrawl', 'tavily', or 'external'."
         )

@@ -85,13 +85,13 @@
 			// Convert timeout strings to numbers for number input fields
 			if (webConfig.FIRECRAWL_TIMEOUT && typeof webConfig.FIRECRAWL_TIMEOUT === 'string') {
 				const parsed = parseInt(webConfig.FIRECRAWL_TIMEOUT);
-				if (!isNaN(parsed)) {
+				if (!Number.isNaN(parsed)) {
 					webConfig.FIRECRAWL_TIMEOUT = parsed;
 				}
 			}
 			if (webConfig.PLAYWRIGHT_TIMEOUT && typeof webConfig.PLAYWRIGHT_TIMEOUT === 'string') {
 				const parsed = parseInt(webConfig.PLAYWRIGHT_TIMEOUT);
-				if (!isNaN(parsed)) {
+				if (!Number.isNaN(parsed)) {
 					webConfig.PLAYWRIGHT_TIMEOUT = parsed;
 				}
 			}

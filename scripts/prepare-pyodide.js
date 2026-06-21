@@ -26,7 +26,7 @@ const pypiPackages = ['black', 'pathspec', 'mypy_extensions', 'pytokens'];
 
 import { loadPyodide } from 'pyodide';
 import { setGlobalDispatcher, ProxyAgent } from 'undici';
-import { writeFile, readFile, copyFile, readdir, rmdir, access } from 'fs/promises';
+import { writeFile, readFile, copyFile, readdir, rmdir, access } from 'node:fs/promises';
 
 /**
  * Loading network proxy configurations from the environment variables.
@@ -45,7 +45,7 @@ function initNetworkProxyFromEnv() {
 	 * use only http(s) proxy because socks5 proxy is not supported currently:
 	 * @see https://github.com/nodejs/undici/issues/2224
 	 */
-	if (!preferedProxy || !preferedProxy.startsWith('http')) return;
+	if (!preferedProxy?.startsWith('http')) return;
 	let preferedProxyURL;
 	try {
 		preferedProxyURL = new URL(preferedProxy).toString();

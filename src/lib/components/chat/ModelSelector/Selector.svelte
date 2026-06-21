@@ -103,8 +103,8 @@
 		if (!show) return;
 		const target = e.target as Node;
 		if (
-			(triggerElement && triggerElement.contains(target)) ||
-			(contentElement && contentElement.contains(target))
+			(triggerElement?.contains(target)) ||
+			(contentElement?.contains(target))
 		) {
 			return;
 		}
