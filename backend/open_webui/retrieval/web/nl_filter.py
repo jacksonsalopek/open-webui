@@ -77,6 +77,35 @@ class WebSearchFilter(BaseModel):
             self.before = None
         return self
 
+    @model_validator(mode='after')
+    def _drop_future_after(self) -> 'WebSearchFilter':
+        # ``after > today`` is nonsensical — no provider has content published
+        # in the future. Observed failure mode: granite4.1:8b sometimes
+        # emits today's date (or later) as ``after`` for queries with zero
+        # recency intent ("constraining LLM context windows"), which then
+        # filters out every real result. Drop the bound and let the search
+        # run unfiltered. We keep ``after == today`` intact because some
+        # legitimate breaking-news queries land there.
+        today = date.today()
+        if self.after and self.after > today:
+            log.debug(
+                'nl_filter: dropping future after=%s (today=%s)',
+                self.after,
+                today,
+            )
+            self.after = None
+        if self.before and self.before > today:
+            # ``before`` in the future is a no-op for the date filter — every
+            # past document is "before the future" — so drop it to keep the
+            # provider params clean.
+            log.debug(
+                'nl_filter: dropping future before=%s (today=%s)',
+                self.before,
+                today,
+            )
+            self.before = None
+        return self
+
     def is_empty(self) -> bool:
         return not any(
             [

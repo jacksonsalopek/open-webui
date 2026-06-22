@@ -62,9 +62,17 @@ from open_webui.routers.pipelines import (
     process_pipeline_inlet_filter,
     process_pipeline_outlet_filter,
 )
+from open_webui.retrieval.web.arxiv_router import route_query as route_arxiv
+from open_webui.retrieval.web.docs_router import route_query as route_docs
+from open_webui.retrieval.web.hf_router import route_query as route_hf
 from open_webui.retrieval.web.nl_filter import (
     is_pure_datetime_query,
     synthesize_datetime_answer,
+)
+from open_webui.utils.weather import (
+    extract_weather_location_hint,
+    is_weather_query,
+    synthesize_weather_answer,
 )
 from open_webui.routers.retrieval import (
     SearchForm,
@@ -983,29 +991,86 @@ def handle_responses_streaming_event(
 
 
 def get_source_context(sources: list, source_ids: dict = None, include_content: bool = True) -> str:
+    """Build ``<source>`` tag context string from citation sources.
+
+    Chunks that resolve to the same logical source (same URL, same file
+    id, same retrieval key) are merged into a single ``<source id="N">``
+    block instead of being emitted as multiple sibling tags that share
+    an id. The previous shape -- one tag per ``(doc, meta)`` pair --
+    produced legitimately confusing prompts whenever the retriever
+    returned more than one top-K chunk from the same page, which is the
+    common case for web-search results (e.g. parallel HF + Kagi both
+    surfacing chunks of ``ai.google.dev/gemma``). The model would see::
+
+        <source id="1" ...>...intro paragraph...</source>
+        <source id="1" ...>...later paragraph...</source>
+
+    and visibly try to reconcile the duplicate ids in its thought trace
+    ("source id '1' appears twice ... should we differentiate?"),
+    burning tokens on bookkeeping that adds no real signal.
+
+    Merging is safe because chunks from the same source already share
+    all citation-relevant metadata (name / type / resource-id); we just
+    join their bodies with a blank line so the model can still see
+    chunk boundaries. Per-id ordering and the integer ids handed back
+    via ``source_ids`` are preserved so existing citation markers in the
+    response continue to resolve.
     """
-    Build <source> tag context string from citation sources.
-    """
-    context_string = ''
     if source_ids is None:
         source_ids = {}
+
+    # First pass: assign numeric ids (preserving the existing scheme so
+    # the caller's shared ``source_ids`` dict carries the same key->int
+    # mapping it always did) and group bodies per numeric id. We also
+    # remember the first-seen attributes for each id so the merged tag
+    # keeps stable name / type / resource-id attributes even if a later
+    # outer source resolves to the same id.
+    grouped: dict[int, dict] = {}
+    insertion_order: list[int] = []
+
     for source in sources:
+        src = source.get('source', {}) or {}
+        src_name = src.get('name')
+        src_type = src.get('type')
+        src_rid = src.get('id')
         for doc, meta in zip(source.get('document', []), source.get('metadata', [])):
-            source_id = meta.get('source') or source.get('source', {}).get('id') or 'N/A'
+            meta = meta or {}
+            source_id = meta.get('source') or src_rid or 'N/A'
             if source_id not in source_ids:
                 source_ids[source_id] = len(source_ids) + 1
-            src_name = source.get('source', {}).get('name')
-            src_type = source.get('source', {}).get('type')
-            src_rid = source.get('source', {}).get('id')
-            body = doc if include_content else ''
-            context_string += (
-                f'<source id="{source_ids[source_id]}"'
-                + (f' name="{src_name}"' if src_name else '')
-                + (f' resource-type="{src_type}"' if src_type else '')
-                + (f' resource-id="{src_rid}"' if src_rid else '')
-                + f'>{body}</source>\n'
-            )
-    return context_string
+            nid = source_ids[source_id]
+            if nid not in grouped:
+                grouped[nid] = {
+                    'name': src_name,
+                    'type': src_type,
+                    'rid': src_rid,
+                    'bodies': [],
+                }
+                insertion_order.append(nid)
+            if include_content and doc:
+                grouped[nid]['bodies'].append(doc)
+
+    parts: list[str] = []
+    for nid in insertion_order:
+        entry = grouped[nid]
+        if include_content:
+            # ``\n\n`` keeps chunk boundaries visible to the model while
+            # still presenting them as one logical source. Empty bodies
+            # are dropped above so we don't accrue blank-line padding.
+            body = '\n\n'.join(entry['bodies'])
+        else:
+            body = ''
+        tag = f'<source id="{nid}"'
+        if entry['name']:
+            tag += f' name="{entry["name"]}"'
+        if entry['type']:
+            tag += f' resource-type="{entry["type"]}"'
+        if entry['rid']:
+            tag += f' resource-id="{entry["rid"]}"'
+        tag += f'>{body}</source>'
+        parts.append(tag)
+
+    return ''.join(p + '\n' for p in parts)
 
 
 async def apply_source_context_to_messages(
@@ -1860,53 +1925,183 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
         )
         return form_data
 
-    queries = []
-    try:
-        res = await generate_queries(
-            request,
-            {
-                'model': form_data['model'],
-                'messages': messages,
-                'prompt': user_message,
-                'type': 'web_search',
-                'chat_id': extra_params.get('__chat_id__'),
-            },
+    # Pure weather questions answer themselves from NWS / Open-Meteo (see
+    # open_webui.utils.weather). Short-circuits the same way the system
+    # clock does: NO Kagi call, NO LLM query expansion, NO playwright
+    # fetch. The synthesized blurb is injected as a synthetic web_search-
+    # typed source so the model sees it like any other retrieved source.
+    # When the user has no location set, synthesize_weather_answer
+    # returns a helpful "you need to enable Settings -> Interface ->
+    # Allow User Location" line, which the model relays to the user.
+    if is_weather_query(user_message):
+        # Pull out an optional "in <place>" hint so queries like
+        # "weather in Athens?" resolve to Athens rather than the
+        # asker's profile location. Returns None for plain queries like
+        # "what's the temperature?", in which case the synthesizer
+        # falls back to user.info.location.
+        weather_location_hint = extract_weather_location_hint(user_message)
+        # Run the (blocking) provider chain off the event loop. The
+        # weather utility's TTL cache means steady-state calls are local;
+        # cold calls cost one or two HTTP round trips (NWS points + obs,
+        # or Open-Meteo current) which we don't want to pin the loop on.
+        weather_answer = await asyncio.to_thread(
+            synthesize_weather_answer,
             user,
+            None,
+            weather_location_hint,
         )
+        log.debug(
+            'chat_web_search_handler: short-circuited weather query=%r '
+            'location_hint=%r answer=%r',
+            user_message,
+            weather_location_hint,
+            weather_answer,
+        )
+        synthetic_url = 'urn:open-webui:weather'
+        files = form_data.get('files', []) or []
+        files.append(
+            {
+                'docs': [
+                    {
+                        'content': weather_answer,
+                        'metadata': {
+                            'source': synthetic_url,
+                            'title': 'Current weather',
+                            'snippet': weather_answer,
+                            'link': synthetic_url,
+                        },
+                    }
+                ],
+                'name': user_message,
+                'type': 'web_search',
+                'urls': [synthetic_url],
+                'queries': [user_message],
+            }
+        )
+        form_data['files'] = files
+        await event_emitter(
+            {
+                'type': 'status',
+                'data': {
+                    'action': 'web_search',
+                    'description': 'Answered from weather provider',
+                    'urls': [synthetic_url],
+                    'done': True,
+                },
+            }
+        )
+        return form_data
 
-        # generate_queries returns a JSONResponse on error (e.g. model not
-        # found, chat completion failure).  Extract the error detail and
-        # re-raise so the outer except block falls back to using the raw
-        # user message as the search query.
-        if isinstance(res, JSONResponse):
-            try:
-                error_body = json.loads(res.body)
-                detail = error_body.get('detail', 'Query generation failed')
-            except Exception:
-                detail = 'Query generation failed'
-            raise Exception(detail)
-
-        response = res['choices'][0]['message']['content']
-
-        try:
-            bracket_start = response.rfind('{')
-            bracket_end = response.rfind('}') + 1
-
-            if bracket_start == -1 or bracket_end == -1:
-                raise Exception('No JSON object found in the response')
-
-            response = response[bracket_start:bracket_end]
-            queries = json.loads(response)
-            queries = queries.get('queries', [])
-        except Exception as e:
-            queries = [response]
-
-        if ENABLE_QUERIES_CACHE:
-            request.state.cached_queries = queries
-
+    # Short-circuit query expansion for explicit routing bangs. When the
+    # user types ``!winui navigationview`` or ``!arxiv attention``, they're
+    # signaling deterministic intent (specific docs portal / arXiv) for
+    # *that exact* query. Asking a task model to expand it produces
+    # off-topic variants — e.g. ``!winui navigationview`` was expanding to
+    # "winui navigationview price" / "winui navigationview installation",
+    # which Kagi then dutifully searched. Bypass the LLM expander entirely
+    # for bang queries and use the cleaned query verbatim. The downstream
+    # ``search_web`` router consumes the bang on its own and dispatches to
+    # the right portal, so we strip it here too — passing ``!winui foo`` as
+    # a literal query confuses the portal adapters (and isn't what the user
+    # intended either).
+    # Skip LLM query expansion whenever a deterministic router (arXiv,
+    # docs, Hugging Face) recognizes the query -- regardless of whether
+    # that recognition is from a bang (``exclusive=True``) or a
+    # keyword/family auto-route (``exclusive=False``). The shared
+    # principle: if the router already knows where this query belongs,
+    # the user's wording already carries the routing signal, and the
+    # task model just dilutes it with generic web-y variants
+    # ("specifications", "pricing", "installation", ...) that Kagi then
+    # dutifully searches for. Concrete failure mode we're fixing here:
+    # "What is the latest official gemma model?" was getting expanded
+    # into "Gemma model specifications" and "Gemma model pricing"
+    # despite the HF router's family auto-route matching "gemma" and
+    # already fanning out to Hugging Face + Kagi in parallel.
+    short_circuit_reason: Optional[str] = None
+    try:
+        arxiv_decision = route_arxiv(user_message or '')
+        if arxiv_decision.matched:
+            short_circuit_reason = (
+                'arxiv-bang' if arxiv_decision.exclusive else 'arxiv-keyword'
+            )
+        else:
+            docs_decision = route_docs(user_message or '')
+            if docs_decision.engine is not None:
+                kind = 'bang' if docs_decision.exclusive else 'keyword'
+                short_circuit_reason = f'{docs_decision.engine}-{kind}'
+            else:
+                hf_decision = route_hf(user_message or '')
+                if hf_decision.matched:
+                    short_circuit_reason = (
+                        'huggingface-bang'
+                        if hf_decision.exclusive
+                        else 'huggingface-family'
+                    )
     except Exception as e:
-        log.exception(e)
-        queries = [user_message or '']
+        # Any router glitch falls through to the LLM expander -- we never
+        # want this optimization to break the search path entirely.
+        log.debug('chat_web_search_handler: router detection failed: %s', e)
+        short_circuit_reason = None
+
+    queries = []
+    if short_circuit_reason is not None:
+        log.debug(
+            'chat_web_search_handler: skipping query expansion (%s); using raw=%r',
+            short_circuit_reason,
+            user_message,
+        )
+        # The original query goes back to ``search_web`` so the router
+        # sees the bang/keyword/family signal and dispatches accordingly.
+        # Passing a "cleaned" form (bang stripped) would route to Kagi
+        # only -- the router strips the bang again before the HTTP call.
+        queries = [user_message]
+    else:
+        try:
+            res = await generate_queries(
+                request,
+                {
+                    'model': form_data['model'],
+                    'messages': messages,
+                    'prompt': user_message,
+                    'type': 'web_search',
+                    'chat_id': extra_params.get('__chat_id__'),
+                },
+                user,
+            )
+
+            # generate_queries returns a JSONResponse on error (e.g. model not
+            # found, chat completion failure).  Extract the error detail and
+            # re-raise so the outer except block falls back to using the raw
+            # user message as the search query.
+            if isinstance(res, JSONResponse):
+                try:
+                    error_body = json.loads(res.body)
+                    detail = error_body.get('detail', 'Query generation failed')
+                except Exception:
+                    detail = 'Query generation failed'
+                raise Exception(detail)
+
+            response = res['choices'][0]['message']['content']
+
+            try:
+                bracket_start = response.rfind('{')
+                bracket_end = response.rfind('}') + 1
+
+                if bracket_start == -1 or bracket_end == -1:
+                    raise Exception('No JSON object found in the response')
+
+                response = response[bracket_start:bracket_end]
+                queries = json.loads(response)
+                queries = queries.get('queries', [])
+            except Exception as e:
+                queries = [response]
+
+            if ENABLE_QUERIES_CACHE:
+                request.state.cached_queries = queries
+
+        except Exception as e:
+            log.exception(e)
+            queries = [user_message or '']
 
     # Drop datetime-only sub-queries before they reach Kagi. The query
     # generator (small task model) routinely emits "Today's date" /
@@ -1915,7 +2110,12 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
     # zero hits, which used to bubble up as "No results found from web
     # search". We keep the rest of the generated queries (real search
     # intents) and run them as normal.
-    queries = [q for q in queries if isinstance(q, str) and not is_pure_datetime_query(q)]
+    queries = [
+        q for q in queries
+        if isinstance(q, str)
+        and not is_pure_datetime_query(q)
+        and not is_weather_query(q)
+    ]
 
     # Dedupe near-identical queries. Small task models (gemma-3-1b in
     # particular) like to emit the same query with trivial wording tweaks

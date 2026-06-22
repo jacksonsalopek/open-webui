@@ -11,7 +11,8 @@ import time
 import uuid
 from datetime import date, datetime
 from pathlib import Path
-from typing import Callable, Iterator, Optional, Sequence, Union
+from typing import Callable, Iterator, NamedTuple, Optional, Sequence, Union
+from urllib.parse import urlparse
 
 import tiktoken
 from fastapi import (
@@ -76,10 +77,21 @@ from open_webui.retrieval.utils import (
 from open_webui.retrieval.vector.async_client import ASYNC_VECTOR_DB_CLIENT
 from open_webui.retrieval.vector.factory import VECTOR_DB_CLIENT
 from open_webui.retrieval.vector.utils import filter_metadata
-# Web search: Kagi is the only supported engine in this fork. Other providers
-# were stripped to keep the surface area (and config sprawl) minimal.
+# Web search: Kagi is the default engine in this fork; arXiv, MDN, and
+# Microsoft Learn are parallel providers that subject-specific queries get
+# routed to. Other providers were stripped to keep the surface area (and
+# config sprawl) minimal.
+from open_webui.retrieval.web.arxiv import search_arxiv
+from open_webui.retrieval.web.arxiv_router import route_query as route_arxiv
+from open_webui.retrieval.web.bb_router import route_query as route_bitbucket
+from open_webui.retrieval.web.bitbucket import search_bitbucket
+from open_webui.retrieval.web.docs_router import route_query as route_docs
+from open_webui.retrieval.web.hf_router import route_query as route_hf
+from open_webui.retrieval.web.huggingface import search_huggingface
 from open_webui.retrieval.web.kagi import search_kagi
 from open_webui.retrieval.web.kagi_lenses import route_query as route_kagi_lens
+from open_webui.retrieval.web.mdn import search_mdn
+from open_webui.retrieval.web.mslearn import search_mslearn
 from open_webui.retrieval.web.main import SearchResult
 from open_webui.retrieval.web.nl_filter import (
     WebSearchFilter,
@@ -1709,33 +1721,41 @@ async def process_web(
         )
 
 
-async def search_web(
-    request: Request, engine: str, query: str, user=None
-) -> list[SearchResult]:
-    """Run a web search, applying natural-language filters where possible.
+class _EnginePlan(NamedTuple):
+    """One leg of a (possibly fanned-out) dispatch plan.
 
-    Pipeline (Kagi):
+    Each plan entry is dispatched concurrently via :func:`asyncio.gather`;
+    a single-entry plan reduces to the pre-fanout behavior. ``query`` is
+    the engine-specific query string (bangs stripped where the engine's
+    router fired; original otherwise).
+    """
 
-    1. Lens routing — the configured Kagi lens YAML is checked for bang
-       prefixes (``!reddit``) and keyword triggers; the first match yields a
-       ``lens_id`` and a (potentially cleaned) query.
-    2. Natural-language filter — :func:`extract_filter_from_query` parses
-       date/region/domain/keyword intent from the (cleaned) query.
-    3. Dispatch — both the lens and the NL filter are forwarded to
-       :func:`search_kagi`. A routed lens takes precedence over any inline
-       lens the NL filter would have built.
+    engine: str
+    query: str
+    lens_id: Optional[str] = None
+    arxiv_category: Optional[str] = None
+    mslearn_product: Optional[str] = None
+    hf_author: Optional[str] = None
+    hf_sort: Optional[str] = None
+    # Bitbucket: workspace is pulled from app.state.config at dispatch time
+    # (so a config change without a restart takes effect immediately).
+    # repo_slug is the second half of a `workspace/reposlug` reference; when
+    # None, the PR-search leg of the Bitbucket fanout is skipped because
+    # Bitbucket Cloud has no workspace-wide PR API.
+    bb_repo_slug: Optional[str] = None
 
-    Each layer fails open: a missing lens config, a downed NL-filter model,
-    or a parse error all degrade gracefully to a plain search.
+
+async def _build_kagi_plan(request: Request, query: str) -> _EnginePlan:
+    """Resolve Kagi lens routing and return a Kagi ``_EnginePlan``.
+
+    Pulled out as a helper because both the "Kagi-only" path and every
+    fanout path need an EnginePlan for Kagi with the lens YAML applied.
     """
     lens_id: Optional[str] = None
-    lens_name: Optional[str] = None
-    effective_query = query
-    if engine == 'kagi' and getattr(
-        request.app.state.config, 'ENABLE_KAGI_LENS_ROUTING', True
-    ):
+    cleaned = query
+    if getattr(request.app.state.config, 'ENABLE_KAGI_LENS_ROUTING', True):
         try:
-            lens_id, effective_query, lens_name = await asyncio.to_thread(
+            lens_id, cleaned, lens_name = await asyncio.to_thread(
                 route_kagi_lens,
                 query,
                 config_path=getattr(
@@ -1745,19 +1765,357 @@ async def search_web(
         except Exception as e:  # never let lens routing break search
             log.debug('search_web: kagi lens routing failed: %s', e)
             lens_id = None
-            effective_query = query
+            cleaned = query
             lens_name = None
-
         if lens_id:
             log.debug(
                 "search_web: kagi lens routed query=%r → lens=%s (%s); cleaned=%r",
                 query,
                 lens_id,
                 lens_name,
-                effective_query,
+                cleaned,
+            )
+    return _EnginePlan(engine='kagi', query=cleaned, lens_id=lens_id)
+
+
+async def _build_dispatch_plan(
+    request: Request, default_engine: str, query: str
+) -> list[_EnginePlan]:
+    """Decide which engines to fan out to for ``query``.
+
+    Returns a non-empty list of :class:`_EnginePlan` entries. A single entry
+    is the no-fanout case (configured default, single bang match, or fanout
+    disabled). Multiple entries trigger parallel dispatch + merge.
+
+    Routing precedence (any layer fails open):
+
+    1. **arXiv** — if a bang fires, return arXiv-only. If a keyword fires
+       and ``WEB_SEARCH_FANOUT_KAGI`` is enabled, return [arXiv, Kagi].
+    2. **Doc portals (MDN / Microsoft Learn)** — same bang-vs-keyword
+       split. Only consulted when arXiv didn't already win.
+    3. **Hugging Face** — bang / portal keyword / open-weights family
+       auto-route. Family matches forward a canonical HF org as
+       ``hf_author`` so we surface official releases (``google/gemma-3``,
+       ``meta-llama/Llama-3.3``) and false-positive matches collapse to
+       ~zero results.
+    4. **Kagi** — fallback when no specialty router fired. Lens routing is
+       applied here.
+    """
+    config = request.app.state.config
+    fanout_enabled = getattr(config, 'WEB_SEARCH_FANOUT_KAGI', True)
+
+    if default_engine == 'kagi' and getattr(config, 'ENABLE_ARXIV_SEARCH', True):
+        try:
+            arxiv = await asyncio.to_thread(route_arxiv, query)
+        except Exception as e:  # never let arxiv routing break search
+            log.debug('search_web: arxiv routing failed: %s', e)
+            arxiv = None  # type: ignore[assignment]
+
+        if arxiv is not None and arxiv.matched:
+            log.debug(
+                "search_web: arxiv intent routed query=%r cat=%s cleaned=%r exclusive=%s",
+                query,
+                arxiv.category,
+                arxiv.query,
+                arxiv.exclusive,
+            )
+            plan: list[_EnginePlan] = [
+                _EnginePlan(
+                    engine='arxiv',
+                    query=arxiv.query,
+                    arxiv_category=arxiv.category,
+                )
+            ]
+            if not arxiv.exclusive and fanout_enabled:
+                plan.append(await _build_kagi_plan(request, query))
+            return plan
+
+    if default_engine == 'kagi' and getattr(config, 'ENABLE_DOCS_ROUTING', True):
+        try:
+            docs = await asyncio.to_thread(route_docs, query)
+        except Exception as e:  # never let docs routing break search
+            log.debug('search_web: docs routing failed: %s', e)
+            docs = None  # type: ignore[assignment]
+
+        if docs is not None and docs.engine is not None:
+            portal_enabled = (
+                docs.engine == 'mdn'
+                and getattr(config, 'ENABLE_MDN_SEARCH', True)
+            ) or (
+                docs.engine == 'mslearn'
+                and getattr(config, 'ENABLE_MSLEARN_SEARCH', True)
+            )
+            if portal_enabled:
+                log.debug(
+                    "search_web: docs routing → %s (product=%s); query=%r cleaned=%r exclusive=%s",
+                    docs.engine,
+                    docs.product,
+                    query,
+                    docs.query,
+                    docs.exclusive,
+                )
+                plan = [
+                    _EnginePlan(
+                        engine=docs.engine,
+                        query=docs.query,
+                        mslearn_product=docs.product,
+                    )
+                ]
+                if not docs.exclusive and fanout_enabled:
+                    plan.append(await _build_kagi_plan(request, query))
+                return plan
+            log.debug(
+                'search_web: docs routing matched %s but engine is disabled; falling back to kagi',
+                docs.engine,
             )
 
-    search_filter = await asyncio.to_thread(extract_filter_from_query, effective_query)
+    if default_engine == 'kagi' and getattr(config, 'ENABLE_HF_SEARCH', True):
+        try:
+            hf = await asyncio.to_thread(route_hf, query)
+        except Exception as e:  # never let hf routing break search
+            log.debug('search_web: hf routing failed: %s', e)
+            hf = None  # type: ignore[assignment]
+
+        if hf is not None and hf.matched:
+            log.debug(
+                "search_web: hf intent routed query=%r author=%s cleaned=%r exclusive=%s",
+                query,
+                hf.author,
+                hf.query,
+                hf.exclusive,
+            )
+            plan = [
+                _EnginePlan(
+                    engine='huggingface',
+                    query=hf.query,
+                    hf_author=hf.author,
+                    hf_sort=hf.sort,
+                )
+            ]
+            if not hf.exclusive and fanout_enabled:
+                plan.append(await _build_kagi_plan(request, query))
+            return plan
+
+    # Bitbucket: internal-codebase intent. Gated on both the feature flag
+    # and the presence of a workspace+token (no point routing to a backend
+    # we can't authenticate to). Sits after the public-portal routers but
+    # before the Kagi fallback because "our codebase" / `workspace/repo`
+    # references are unambiguous and should win over a generic web search.
+    if (
+        default_engine == 'kagi'
+        and getattr(config, 'ENABLE_BITBUCKET_SEARCH', False)
+        and getattr(config, 'BITBUCKET_ACCESS_TOKEN', '')
+        and getattr(config, 'BITBUCKET_WORKSPACE', '')
+    ):
+        try:
+            bb = await asyncio.to_thread(
+                route_bitbucket, query, getattr(config, 'BITBUCKET_WORKSPACE', '')
+            )
+        except Exception as e:
+            log.debug('search_web: bitbucket routing failed: %s', e)
+            bb = None  # type: ignore[assignment]
+
+        if bb is not None and bb.matched:
+            log.debug(
+                'search_web: bitbucket intent routed query=%r cleaned=%r '
+                'repo_slug=%s exclusive=%s',
+                query,
+                bb.query,
+                bb.repo_slug,
+                bb.exclusive,
+            )
+            plan = [
+                _EnginePlan(
+                    engine='bitbucket',
+                    query=bb.query,
+                    bb_repo_slug=bb.repo_slug,
+                )
+            ]
+            if not bb.exclusive and fanout_enabled:
+                plan.append(await _build_kagi_plan(request, query))
+            return plan
+
+    # Kagi default (or non-Kagi configured engine with no specialty routing).
+    if default_engine == 'kagi':
+        return [await _build_kagi_plan(request, query)]
+    return [_EnginePlan(engine=default_engine, query=query)]
+
+
+def _dedup_key(link: str) -> str:
+    """Normalize a result URL for cross-engine dedup.
+
+    arXiv exposes the same paper at both ``arxiv.org/abs/X.Y`` and
+    ``arxiv.org/pdf/X.Y``, and Kagi may return either form. Strip the
+    ``/abs/`` vs ``/pdf/`` distinction and the trailing version suffix so
+    they collapse to the same key.
+    """
+    if not link:
+        return ''
+    parsed = urlparse(link)
+    netloc = parsed.netloc.lower()
+    path = parsed.path
+    if netloc.endswith('arxiv.org'):
+        path = path.replace('/pdf/', '/abs/')
+        # Strip trailing version suffix (``v1`` / ``v2``) + optional .pdf
+        path = re.sub(r'v\d+(\.pdf)?$', '', path)
+    path = path.rstrip('/')
+    return f'{netloc}{path}'
+
+
+def _merge_results(
+    bundles: list[list[SearchResult]], *, max_count: int
+) -> list[SearchResult]:
+    """Round-robin interleave + dedup-by-URL + cap at ``max_count``.
+
+    Round-robin preserves the top result from every provider in the merged
+    list, so portal-specific authoritative results don't get crowded out by
+    Kagi's broader index (or vice-versa). The dedup keeps cross-engine
+    overlap from wasting the result budget.
+    """
+    if max_count <= 0:
+        return []
+    seen: set[str] = set()
+    merged: list[SearchResult] = []
+    indices = [0] * len(bundles)
+    while len(merged) < max_count and any(
+        indices[i] < len(bundles[i]) for i in range(len(bundles))
+    ):
+        for i, bundle in enumerate(bundles):
+            if indices[i] >= len(bundle):
+                continue
+            result = bundle[indices[i]]
+            indices[i] += 1
+            key = _dedup_key(result.link)
+            if key and key in seen:
+                continue
+            if key:
+                seen.add(key)
+            merged.append(result)
+            if len(merged) >= max_count:
+                break
+    return merged
+
+
+async def _run_plan(
+    request: Request,
+    plan: list[_EnginePlan],
+    *,
+    search_filter: Optional[WebSearchFilter],
+    user=None,
+) -> list[SearchResult]:
+    """Execute every leg of ``plan`` concurrently and merge the results.
+
+    Per-engine post-filtering (``apply_to_results``) runs on each leg
+    independently — Kagi already does the filter natively
+    (``has_full_native_support``) so it's skipped there, while the portal
+    adapters get the generic post-filter. Single-engine plans short-circuit
+    the merge so the no-fanout path stays a single ``apply_to_results`` call.
+    """
+
+    async def run_one(entry: _EnginePlan) -> list[SearchResult]:
+        try:
+            results = await _dispatch_web_search(
+                request,
+                entry.engine,
+                entry.query,
+                user=user,
+                search_filter=search_filter,
+                lens_id=entry.lens_id,
+                arxiv_category=entry.arxiv_category,
+                mslearn_product=entry.mslearn_product,
+                hf_author=entry.hf_author,
+                hf_sort=entry.hf_sort,
+                bb_repo_slug=entry.bb_repo_slug,
+            )
+        except Exception as e:
+            # Fanout partial-failure tolerance: an upstream outage on one
+            # engine shouldn't black-hole the whole search. Log loudly so
+            # the failure is visible, then return [] and let the merge
+            # surface results from the other legs.
+            log.warning(
+                'search_web: %s engine failed in fanout (%d-leg plan): %s',
+                entry.engine,
+                len(plan),
+                e,
+            )
+            return []
+
+        if (
+            search_filter is not None
+            and not search_filter.is_empty()
+            and not has_full_native_support(entry.engine)
+        ):
+            results = search_filter.apply_to_results(results)
+        return results
+
+    bundles = await asyncio.gather(*(run_one(entry) for entry in plan))
+
+    if len(bundles) == 1:
+        return bundles[0]
+
+    max_count = request.app.state.config.WEB_SEARCH_RESULT_COUNT
+    merged = _merge_results(bundles, max_count=max_count)
+    log.debug(
+        'search_web: fanout merged %s -> %d result(s) (engines=%s)',
+        [len(b) for b in bundles],
+        len(merged),
+        [entry.engine for entry in plan],
+    )
+    return merged
+
+
+async def search_web(
+    request: Request, engine: str, query: str, user=None
+) -> list[SearchResult]:
+    """Run a web search, applying natural-language filters where possible.
+
+    Pipeline:
+
+    1. **Plan build** (:func:`_build_dispatch_plan`) — consults the arXiv,
+       doc-portal, and Kagi-lens routers in priority order. Bang matches
+       are exclusive (portal-only). Keyword matches fan out to the portal
+       *and* Kagi in parallel for broader coverage, gated by
+       ``WEB_SEARCH_FANOUT_KAGI``.
+    2. **NL filter** — :func:`extract_filter_from_query` parses
+       date/region/domain/keyword intent from the primary (cleaned) query
+       and is shared across every leg of the plan.
+    3. **Dispatch + merge** (:func:`_run_plan`) — every leg of the plan is
+       dispatched concurrently via ``asyncio.gather``. Per-engine
+       post-filtering runs on each leg; results are round-robin interleaved
+       and deduplicated.
+
+    Each layer fails open: a missing lens config, a downed NL-filter model,
+    a routing parse error, or even a complete engine outage all degrade
+    gracefully — a fanout sibling can carry the search alone.
+    """
+    plan = await _build_dispatch_plan(request, engine, query)
+
+    # The "primary" leg is the first plan entry — for fanout queries this
+    # is the specialty engine (arXiv / MDN / MS Learn); for single-engine
+    # plans it's the only engine. Use its (potentially bang-stripped) query
+    # as the NL filter input so the filter operates on the user's actual
+    # intent rather than the routing marker.
+    nl_query = plan[0].query
+    engines_label = '+'.join(entry.engine for entry in plan)
+
+    # Skip the NL filter call when the plan has no Kagi leg. The portal
+    # adapters (arXiv / MDN / MS Learn) don't benefit much from the filter
+    # (their result domains are pinned; their date handling is engine-
+    # specific) and a hallucinated ``after`` from the task model can silently
+    # filter every result out — observed: granite4.1:8b emitting
+    # ``after=today`` for "!arxiv constraining LLM context windows", which
+    # then made the arxiv post-filter drop all 24 returned papers. When a
+    # Kagi leg IS in the plan (default search or keyword fanout), the
+    # filter still runs and benefits Kagi's native filter params.
+    needs_nl_filter = any(entry.engine == 'kagi' for entry in plan)
+    if needs_nl_filter:
+        search_filter = await asyncio.to_thread(extract_filter_from_query, nl_query)
+    else:
+        search_filter = None
+        log.debug(
+            "search_web: skipping nl filter for portal-only plan engines=%s",
+            engines_label,
+        )
 
     # Recency-intent → shorter page-cache TTL. The NL filter sets ``after``
     # to ~30d before today for "recent/latest/news" queries and ~1-2d for
@@ -1780,38 +2138,20 @@ async def search_web(
     # failed" is visible without cross-referencing nl_filter's own debug logs.
     if search_filter is not None and not search_filter.is_empty():
         log.debug(
-            "search_web: parsed nl filter for query=%r engine=%s -> %s",
-            effective_query,
-            engine,
+            "search_web: parsed nl filter for query=%r engines=%s -> %s",
+            nl_query,
+            engines_label,
             search_filter.model_dump(exclude_none=True, exclude_defaults=True),
         )
     else:
         log.debug(
-            "search_web: no nl filter applied for query=%r engine=%s "
+            "search_web: no nl filter applied for query=%r engines=%s "
             "(parser returned empty or failed open)",
-            effective_query,
-            engine,
+            nl_query,
+            engines_label,
         )
 
-    results = await _dispatch_web_search(
-        request,
-        engine,
-        effective_query,
-        user=user,
-        search_filter=search_filter,
-        lens_id=lens_id,
-    )
-
-    # Providers with full native support already applied the filter at the
-    # source; post-filtering them risks dropping results they legitimately kept.
-    if (
-        search_filter is not None
-        and not search_filter.is_empty()
-        and not has_full_native_support(engine)
-    ):
-        results = search_filter.apply_to_results(results)
-
-    return results
+    return await _run_plan(request, plan, search_filter=search_filter, user=user)
 
 
 async def _dispatch_web_search(
@@ -1821,6 +2161,11 @@ async def _dispatch_web_search(
     user=None,
     search_filter: Optional[WebSearchFilter] = None,
     lens_id: Optional[str] = None,
+    arxiv_category: Optional[str] = None,
+    mslearn_product: Optional[str] = None,
+    hf_author: Optional[str] = None,
+    hf_sort: Optional[str] = None,
+    bb_repo_slug: Optional[str] = None,
 ) -> list[SearchResult]:
     """Dispatch a web search query to the configured engine and return results.
 
@@ -1842,8 +2187,73 @@ async def _dispatch_web_search(
             lens_id,
         )
 
-    # This fork only supports Kagi; legacy engines are intentionally unsupported.
-    raise Exception(f'Unsupported web search engine: {engine!r} (only "kagi" is configured)')
+    if engine == 'arxiv':
+        return await asyncio.to_thread(
+            search_arxiv,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            search_filter,
+            arxiv_category,
+        )
+
+    if engine == 'mdn':
+        return await asyncio.to_thread(
+            search_mdn,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            search_filter,
+        )
+
+    if engine == 'mslearn':
+        return await asyncio.to_thread(
+            search_mslearn,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            search_filter,
+            mslearn_product,
+        )
+
+    if engine == 'huggingface':
+        return await asyncio.to_thread(
+            search_huggingface,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            search_filter,
+            hf_author,
+            hf_sort,
+        )
+
+    if engine == 'bitbucket':
+        # Pull workspace + token at dispatch time so an admin config edit
+        # (via the WebUI settings UI) takes effect on the next search
+        # without needing a restart. The router already verified both are
+        # set before producing a 'bitbucket' plan entry, but re-check
+        # defensively in case config changed between plan-build and
+        # dispatch.
+        workspace = request.app.state.config.BITBUCKET_WORKSPACE
+        token = request.app.state.config.BITBUCKET_ACCESS_TOKEN
+        if not (workspace and token):
+            log.warning(
+                'search_web: bitbucket dispatch missing workspace/token at exec time; '
+                'returning empty results'
+            )
+            return []
+        return await asyncio.to_thread(
+            search_bitbucket,
+            query,
+            workspace,
+            token,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            repo_slug=bb_repo_slug,
+        )
+
+    # This fork only supports Kagi + the subject-specific portal adapters
+    # (arXiv / MDN / MS Learn / Hugging Face / Bitbucket); legacy engines
+    # are intentionally unsupported.
+    raise Exception(
+        f'Unsupported web search engine: {engine!r} '
+        '(supported: "kagi", "arxiv", "mdn", "mslearn", "huggingface", "bitbucket")'
+    )
 
 
 @router.post('/process/web/search')

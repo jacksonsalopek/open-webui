@@ -57,6 +57,12 @@
 	export let codeInterpreterEnabled = false;
 	export let webSearchEnabled = false;
 
+	// Chat-level params, forwarded through to MessageInput so the reasoning-
+	// effort chip can mutate `params.reasoning_effort` from the placeholder
+	// (first-turn) state too. Bound, not just passed, so changes propagate
+	// back up to Chat.svelte's owning `params`.
+	export let params = {};
+
 	export let onUpload: Function = (e) => {};
 	export let onSelect = (e) => {};
 	export let onChange = (e) => {};
@@ -223,6 +229,7 @@
 					bind:imageGenerationEnabled
 					bind:codeInterpreterEnabled
 					bind:webSearchEnabled
+					bind:params
 					bind:atSelectedModel
 					bind:showCommands
 					bind:dragged

@@ -85,6 +85,7 @@
 	import Wrench from '../icons/Wrench.svelte';
 	import Keyframes from '../icons/Keyframes.svelte';
 	import Sparkles from '../icons/Sparkles.svelte';
+	import LightBulb from '../icons/LightBulb.svelte';
 
 	import InputVariablesModal from './MessageInput/InputVariablesModal.svelte';
 	import Voice from '../icons/Voice.svelte';
@@ -141,6 +142,13 @@
 	export let imageGenerationEnabled = false;
 	export let webSearchEnabled = false;
 	export let codeInterpreterEnabled = false;
+
+	// Chat-level params (same object bound by ChatControls / AdvancedParams).
+	// We only touch `reasoning_effort` here -- the LightBulb chip below cycles
+	// it through null -> 'low' -> 'medium' -> 'high' -> null. Bound (not just
+	// passed) so mutations propagate back up and persist into chat metadata via
+	// Chat.svelte's existing params-save path.
+	export let params = {};
 
 	export let pendingOAuthTools = [];
 
@@ -507,6 +515,16 @@
 		(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.terminal ?? true
 	);
 
+	// Models flagged with the `reasoning` capability accept reasoning_effort.
+	// Opt-in (?? false) -- opposite of web_search etc. -- so the chip only
+	// appears for models we've explicitly marked as reasoning-capable in the
+	// workspace model editor (command-a-plus, gpt-5, ...). Avoids cluttering
+	// the toolbar for plain chat models that would just ignore the param.
+	let reasoningCapableModels = [];
+	$: reasoningCapableModels = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).filter(
+		(model) => $models.find((m) => m.id === model)?.info?.meta?.capabilities?.reasoning ?? false
+	);
+
 	let toggleFilters = [];
 	$: toggleFilters = (atSelectedModel?.id ? [atSelectedModel.id] : selectedModels)
 		.map((id) => $models.find((model) => model.id === id)?.filters ?? [])
@@ -524,6 +542,30 @@
 			webSearchCapableModels.length &&
 		$config?.features?.enable_web_search &&
 		($_user.role === 'admin' || $_user?.permissions?.features?.web_search);
+
+	// Show the effort chip iff every currently-selected model is reasoning-
+	// capable (mirrors the AND-across-models gate used for web search above).
+	// Multi-select chats with one non-reasoning model hide the chip entirely
+	// rather than render a control that only applies to a subset.
+	let showReasoningEffortButton = false;
+	$: showReasoningEffortButton =
+		reasoningCapableModels.length > 0 &&
+		(atSelectedModel?.id ? [atSelectedModel.id] : selectedModels).length ===
+			reasoningCapableModels.length;
+
+	// null -> low -> medium -> high -> null. Centralized here so the cycle order
+	// is one constant rather than scattered comparisons.
+	const REASONING_EFFORT_CYCLE = [null, 'low', 'medium', 'high'];
+	const cycleReasoningEffort = () => {
+		const current = params?.reasoning_effort ?? null;
+		const idx = REASONING_EFFORT_CYCLE.indexOf(current);
+		const next = REASONING_EFFORT_CYCLE[(idx + 1) % REASONING_EFFORT_CYCLE.length];
+		// Reassign through `params = ...` (rather than just mutating the field)
+		// so Svelte's reactivity actually fires and the binding back up to
+		// Chat.svelte's `params` flushes -- in-place property writes on a
+		// bound object don't always re-trigger `$:` blocks reliably.
+		params = { ...params, reasoning_effort: next };
+	};
 
 	let showImageGenerationButton = false;
 	$: showImageGenerationButton =
@@ -1850,6 +1892,33 @@
 												</Tooltip>
 											{/if}
 										{/each}
+
+										{#if showReasoningEffortButton}
+											<Tooltip
+												content={(params?.reasoning_effort ?? null) === null
+													? $i18n.t('Reasoning effort: Default (click to cycle)')
+													: $i18n.t('Reasoning effort: {{level}} (click to cycle)', {
+															level: params.reasoning_effort
+														})}
+												placement="top"
+											>
+												<button
+													on:click|preventDefault={cycleReasoningEffort}
+													type="button"
+													aria-label={$i18n.t('Cycle reasoning effort')}
+													class="group p-[7px] flex gap-1.5 items-center text-sm rounded-full transition-colors duration-300 focus:outline-hidden max-w-full overflow-hidden {(params?.reasoning_effort ?? null) === null
+														? 'bg-transparent text-gray-600 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800'
+														: 'text-sky-500 dark:text-sky-300 bg-sky-50 hover:bg-sky-100 dark:bg-sky-400/10 dark:hover:bg-sky-600/10 border border-sky-200/40 dark:border-sky-500/20'}"
+												>
+													<LightBulb className="size-4" strokeWidth="1.75" />
+													{#if (params?.reasoning_effort ?? null) !== null}
+														<span class="text-xs capitalize self-center">
+															{params.reasoning_effort}
+														</span>
+													{/if}
+												</button>
+											</Tooltip>
+										{/if}
 
 										{#if webSearchEnabled}
 											<Tooltip content={$i18n.t('Web Search')} placement="top">

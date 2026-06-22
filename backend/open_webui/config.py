@@ -1706,6 +1706,110 @@ KAGI_LENSES_CONFIG_PATH = ConfigVar(
     os.getenv('KAGI_LENSES_CONFIG_PATH', '/app/backend/data/kagi_lenses.yaml'),
 )
 
+# arXiv parallel-provider routing. When enabled (default), academic-intent
+# bangs (``!arxiv``, ``!papers``, ``!cs.LG``) and keywords (``preprint``,
+# ``research paper``) override the configured Kagi engine for that single
+# query and hit arXiv's public Atom API instead. No API key required.
+ENABLE_ARXIV_SEARCH = ConfigVar(
+    'ENABLE_ARXIV_SEARCH',
+    'rag.web.search.arxiv.enable',
+    os.getenv('ENABLE_ARXIV_SEARCH', 'True').lower() == 'true',
+)
+
+# Doc-portal routing — MDN (web platform) and Microsoft Learn (Windows /
+# .NET / Azure). The router fires on explicit bangs (``!mdn``, ``!winui``,
+# ``!dotnet``, ``!azure``, ``!mslearn``, ...) and on keywords that name the
+# portal directly (``mdn``, ``learn.microsoft``, ``msdn``). Generic topic
+# keywords stay on Kagi where the dev-doc routing in nl_filter already
+# handles them via Kagi's ``sites_included``.
+ENABLE_DOCS_ROUTING = ConfigVar(
+    'ENABLE_DOCS_ROUTING',
+    'rag.web.search.docs_routing.enable',
+    os.getenv('ENABLE_DOCS_ROUTING', 'True').lower() == 'true',
+)
+
+# Individual portal toggles. Useful if you want to keep routing on but
+# carve out one portal (e.g. disable MDN to stay on Kagi for web queries
+# while still routing Microsoft topics to Learn).
+ENABLE_MDN_SEARCH = ConfigVar(
+    'ENABLE_MDN_SEARCH',
+    'rag.web.search.mdn.enable',
+    os.getenv('ENABLE_MDN_SEARCH', 'True').lower() == 'true',
+)
+
+ENABLE_MSLEARN_SEARCH = ConfigVar(
+    'ENABLE_MSLEARN_SEARCH',
+    'rag.web.search.mslearn.enable',
+    os.getenv('ENABLE_MSLEARN_SEARCH', 'True').lower() == 'true',
+)
+
+# Hugging Face Hub model search. The router fires on:
+#   - bangs: !hf, !huggingface, !hub, !models, !model
+#   - portal keywords: "huggingface", "hf.co", "model card", "model hub"
+#   - open-weights families: "gemma", "llama", "qwen", "mistral",
+#     "mixtral", "phi", "deepseek", "granite", "codestral", "nemotron",
+#     "falcon", "yi", "command-r", etc. (see hf_router._FAMILY_TO_AUTHOR)
+# Family matches scope the HF API to the canonical org (gemma -> google,
+# llama -> meta-llama, ...) so we surface official releases and false
+# positives ("granite countertops", "best llama for trekking") collapse
+# to ~zero HF hits while Kagi handles the real answer via fanout.
+ENABLE_HF_SEARCH = ConfigVar(
+    'ENABLE_HF_SEARCH',
+    'rag.web.search.huggingface.enable',
+    os.getenv('ENABLE_HF_SEARCH', 'True').lower() == 'true',
+)
+
+# Bitbucket Cloud internal-codebase search. Single-workspace, single-token
+# model: BITBUCKET_ACCESS_TOKEN should be a Workspace/Repository Access Token
+# (service token, scoped to "Repositories: Read" — Bitbucket Cloud's
+# replacement for the deprecated App Passwords) or a user-scoped API token.
+# Both authenticate as Bearer. Every user of this WebUI instance shares the
+# same token, so the token's read scope is the access-control boundary —
+# scope it to the company-shared workspace, not a personal user account.
+#
+# The router (:mod:`bb_router`) fires on:
+#   - bangs: !bb, !bitbucket, !repo, !repos, !code
+#   - PR-targeted bangs (require repo slug as next token): !bb-pr, !pr,
+#     !pull, !pulls
+#   - internal-tone keywords: "bitbucket", "our codebase", "our repos",
+#     "internal repo", "company codebase", ...
+#   - inline `<workspace>/<reposlug>` references in the query
+#
+# Three search modes fanned out in parallel:
+#   - Code Search (paid-tier on some plans; 403s fall through cleanly)
+#   - Repository search (BBQL substring filter on name + description)
+#   - PR search (only when a repo slug is resolved — no workspace-wide PR
+#     API exists on Bitbucket Cloud)
+ENABLE_BITBUCKET_SEARCH = ConfigVar(
+    'ENABLE_BITBUCKET_SEARCH',
+    'rag.web.search.bitbucket.enable',
+    os.getenv('ENABLE_BITBUCKET_SEARCH', 'False').lower() == 'true',
+)
+
+BITBUCKET_ACCESS_TOKEN = ConfigVar(
+    'BITBUCKET_ACCESS_TOKEN',
+    'rag.web.search.bitbucket.access_token',
+    os.environ.get('BITBUCKET_ACCESS_TOKEN', ''),
+)
+
+BITBUCKET_WORKSPACE = ConfigVar(
+    'BITBUCKET_WORKSPACE',
+    'rag.web.search.bitbucket.workspace',
+    os.environ.get('BITBUCKET_WORKSPACE', ''),
+)
+
+# Specialty-engine + Kagi fanout. When a specialty router fires on a
+# *keyword* (not a bang) — e.g. "preprint", "mdn", "msdn" — the dispatcher
+# runs the matched portal and Kagi concurrently and merges results. Bang
+# matches always stay portal-only since the user explicitly opted in.
+# Set False to disable fanout entirely (keyword matches behave like bangs,
+# producing portal-only results).
+WEB_SEARCH_FANOUT_KAGI = ConfigVar(
+    'WEB_SEARCH_FANOUT_KAGI',
+    'rag.web.search.fanout_kagi',
+    os.getenv('WEB_SEARCH_FANOUT_KAGI', 'True').lower() == 'true',
+)
+
 MOJEEK_SEARCH_API_KEY = ConfigVar(
     'MOJEEK_SEARCH_API_KEY',
     'rag.web.search.mojeek_search_api_key',

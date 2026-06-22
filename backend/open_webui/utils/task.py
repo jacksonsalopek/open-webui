@@ -1,5 +1,7 @@
+import asyncio
 import logging
 import math
+import os
 import re
 import uuid
 from datetime import datetime
@@ -7,6 +9,7 @@ from typing import Any, Optional
 
 from open_webui.config import DEFAULT_RAG_TEMPLATE
 from open_webui.utils.misc import get_last_user_message, get_messages_content
+from open_webui.utils.weather import get_current_weather
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +104,25 @@ async def prompt_template(template: str, user: Optional[Any] = None) -> str:
     template = template.replace('{{USER_AGE}}', str(USER_VARIABLES.get('age', 'Unknown')))
     template = template.replace('{{USER_LOCATION}}', USER_VARIABLES.get('location', 'Unknown'))
     template = template.replace('{{USER_GROUPS}}', USER_VARIABLES.get('groups', ''))
+
+    # Lazy-fetch current weather only when the template asks for it. Two
+    # API calls (geocode + provider) per prompt render is unacceptable as
+    # an always-on cost, but ``get_current_weather`` has its own TTL
+    # cache so steady-state lookups are local. Runs in a thread so the
+    # blocking ``requests`` calls don't pin the event loop. The feature
+    # is gated by ``ENABLE_WEATHER_PROMPT_VAR`` (default on) so admins
+    # can disable network egress per-deployment without editing prompts.
+    if '{{CURRENT_WEATHER}}' in template:
+        if (os.getenv('ENABLE_WEATHER_PROMPT_VAR', 'True') or 'True').lower() == 'true':
+            loc = USER_VARIABLES.get('location') or ''
+            try:
+                weather = await asyncio.to_thread(get_current_weather, loc)
+            except Exception as e:  # never fail prompt render on weather
+                log.debug('prompt_template: weather lookup raised: %s', e)
+                weather = ''
+        else:
+            weather = ''
+        template = template.replace('{{CURRENT_WEATHER}}', weather)
 
     return template
 

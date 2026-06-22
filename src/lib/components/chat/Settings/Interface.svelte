@@ -33,6 +33,13 @@
 	let splitLargeChunks = false;
 	let scrollOnBranchChange = true;
 	let userLocation = false;
+	// Manual override for `info.location` -- typed by the user when the
+	// browser's Geolocation API isn't available (macOS Location Services
+	// off, HTTP origin, kiosk/VM, etc.). Backend `weather.py` accepts
+	// both ``lat,lon`` and city-name forms here, so we don't need to
+	// pre-validate; whatever the user types is forwarded as-is.
+	let manualLocation = '';
+	let savingManualLocation = false;
 
 	// Interface
 	let defaultModelId = '';
@@ -120,6 +127,12 @@
 
 			if (position) {
 				await updateUserInfo(localStorage.token, { location: position });
+				// Mirror into the in-memory user store so other components
+				// (e.g. message input substituting {{USER_LOCATION}}) see
+				// the new value without a refresh, and so the manual field
+				// below reflects what's now persisted.
+				user.update((u) => (u ? { ...u, info: { ...(u.info ?? {}), location: position } } : u));
+				manualLocation = position;
 				toast.success($i18n.t('User location successfully retrieved.'));
 			} else {
 				userLocation = false;
@@ -127,6 +140,39 @@
 		}
 
 		saveSettings({ userLocation });
+	};
+
+	const saveManualLocation = async () => {
+		const value = (manualLocation ?? '').trim();
+		if (!value) {
+			toast.error($i18n.t('Please enter a location (city name or lat,lon).'));
+			return;
+		}
+		savingManualLocation = true;
+		try {
+			await updateUserInfo(localStorage.token, { location: value });
+			user.update((u) => (u ? { ...u, info: { ...(u.info ?? {}), location: value } } : u));
+			manualLocation = value;
+			toast.success($i18n.t('Location saved.'));
+		} catch (error: any) {
+			toast.error(error?.detail || error?.message || $i18n.t('Failed to save location.'));
+		} finally {
+			savingManualLocation = false;
+		}
+	};
+
+	const clearManualLocation = async () => {
+		savingManualLocation = true;
+		try {
+			await updateUserInfo(localStorage.token, { location: '' });
+			user.update((u) => (u ? { ...u, info: { ...(u.info ?? {}), location: '' } } : u));
+			manualLocation = '';
+			toast.success($i18n.t('Location cleared.'));
+		} catch (error: any) {
+			toast.error(error?.detail || error?.message || $i18n.t('Failed to clear location.'));
+		} finally {
+			savingManualLocation = false;
+		}
 	};
 
 	const toggleTitleAutoGenerate = async () => {
@@ -248,6 +294,11 @@
 		temporaryChatByDefault = $settings?.temporaryChatByDefault ?? false;
 		chatDirection = $settings?.chatDirection ?? 'auto';
 		userLocation = $settings?.userLocation ?? false;
+		// Seed the manual field with whatever's currently stored on the
+		// user's profile so toggling "Allow User Location" off doesn't
+		// erase the value the user can see, and so an existing
+		// browser-acquired ``lat,lon (lat, long)`` value is editable.
+		manualLocation = ($user?.info as { location?: string } | undefined)?.location ?? '';
 		showChatTitleInTab = $settings?.showChatTitleInTab ?? true;
 
 		notificationSound = $settings?.notificationSound ?? true;
@@ -508,6 +559,55 @@
 								toggleUserLocation();
 							}}
 						/>
+					</div>
+				</div>
+
+				<!--
+					Manual location override. Falls back here when the Geolocation
+					API can't (macOS Location Services disabled, non-secure
+					context, kiosk/VM, etc.). Accepts either "City, State/Country"
+					or a "lat,lon" pair; the backend weather.py utility parses both
+					-- exact lat/lon goes straight through, names get geocoded via
+					Open-Meteo with disambiguation by region hint.
+				-->
+				<div class=" py-1 flex w-full items-center gap-2">
+					<div class=" shrink-0 self-center text-xs whitespace-nowrap">
+						{$i18n.t('Set location manually')}
+					</div>
+
+					<div class=" flex-1 min-w-0 flex items-center gap-1">
+						<input
+							class=" text-sm flex-1 min-w-0 bg-transparent outline-hidden outline-none border-b border-gray-200 dark:border-gray-700 py-0.5 text-right"
+							type="text"
+							placeholder={$i18n.t('e.g. Boston, MA or 42.36,-71.05')}
+							bind:value={manualLocation}
+							autocomplete="off"
+							spellcheck="false"
+							on:keydown={(e) => {
+								if (e.key === 'Enter' && !savingManualLocation) {
+									saveManualLocation();
+								}
+							}}
+						/>
+						<button
+							class=" shrink-0 whitespace-nowrap text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50"
+							type="button"
+							disabled={savingManualLocation}
+							on:click={saveManualLocation}
+						>
+							{$i18n.t('Save')}
+						</button>
+						{#if manualLocation}
+							<button
+								class=" shrink-0 whitespace-nowrap text-xs px-2 py-0.5 rounded bg-gray-100 hover:bg-gray-200 dark:bg-gray-800 dark:hover:bg-gray-700 disabled:opacity-50"
+								type="button"
+								disabled={savingManualLocation}
+								on:click={clearManualLocation}
+								title={$i18n.t('Clear')}
+							>
+								{$i18n.t('Clear')}
+							</button>
+						{/if}
 					</div>
 				</div>
 			</div>

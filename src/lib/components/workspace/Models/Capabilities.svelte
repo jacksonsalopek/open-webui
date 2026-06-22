@@ -56,6 +56,12 @@
 			description: $i18n.t(
 				'Automatically inject system tools in native function calling mode (e.g., timestamps, memory, chat history, notes, etc.)'
 			)
+		},
+		reasoning: {
+			label: $i18n.t('Reasoning'),
+			description: $i18n.t(
+				'Model supports the `reasoning_effort` parameter (low / medium / high). Enables a per-chat effort chip near the message input.'
+			)
 		}
 	};
 
@@ -71,6 +77,7 @@
 		citations?: boolean;
 		status_updates?: boolean;
 		builtin_tools?: boolean;
+		reasoning?: boolean;
 	} = {};
 
 	// Hide file_context when file_upload is disabled

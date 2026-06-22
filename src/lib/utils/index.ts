@@ -766,9 +766,44 @@ export const getImportOrigin = (_chats) => {
 };
 
 export const getUserPosition = async (raw = false) => {
-	// Get the user's location using the Geolocation API
-	const position = await new Promise((resolve, reject) => {
-		navigator.geolocation.getCurrentPosition(resolve, reject);
+	// Get the user's location using the Geolocation API.
+	//
+	// `getCurrentPosition`'s error callback gives us a `GeolocationPositionError`
+	// whose `code` is one of 1=PERMISSION_DENIED, 2=POSITION_UNAVAILABLE,
+	// 3=TIMEOUT. Browsers tend to surface a useless `.message` ("Unknown error
+	// acquiring position" on Chromium/macOS in particular) so we translate
+	// the code into something actionable -- the most common failure modes
+	// are (a) macOS Location Services disabled at the OS level even after
+	// the browser grants permission, and (b) the page being served over
+	// HTTP from a non-localhost origin (browsers gate Geolocation on a
+	// secure context). Both look identical to the user otherwise.
+	const position: any = await new Promise((resolve, reject) => {
+		if (!navigator?.geolocation?.getCurrentPosition) {
+			reject(
+				new Error(
+					'Geolocation API is not available in this browser. Enter your location manually in Settings → Interface.'
+				)
+			);
+			return;
+		}
+		navigator.geolocation.getCurrentPosition(
+			resolve,
+			(err: GeolocationPositionError) => {
+				const isSecure = window?.isSecureContext ?? true;
+				const messageByCode: Record<number, string> = {
+					1: 'Browser denied access to your location. Check your site permissions, or set the location manually in Settings → Interface.',
+					2: isSecure
+						? 'Position unavailable. On macOS check System Settings → Privacy & Security → Location Services (enable both the toggle AND your browser in the list). You can also set the location manually in Settings → Interface.'
+						: 'Position unavailable: this page is loaded over an insecure context (HTTP from a non-localhost origin), and browsers block geolocation outside secure contexts. Access Open WebUI via HTTPS or http://localhost, or set the location manually in Settings → Interface.',
+					3: 'Geolocation timed out. Try again, or set the location manually in Settings → Interface.'
+				};
+				const text = messageByCode[err.code] ?? err.message ?? 'Unknown error acquiring position';
+				const e = new Error(text);
+				(e as any).code = err.code;
+				reject(e);
+			},
+			{ timeout: 10000, maximumAge: 600000, enableHighAccuracy: false }
+		);
 	}).catch((error) => {
 		console.error('Error getting user location:', error);
 		throw error;

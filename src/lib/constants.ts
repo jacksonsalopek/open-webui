@@ -108,7 +108,12 @@ export const DEFAULT_CAPABILITIES = {
 	citations: true,
 	status_updates: true,
 	usage: undefined,
-	builtin_tools: true
+	builtin_tools: true,
+	// Opt-in by default: most models don't accept reasoning_effort, and surfacing
+	// the chip on a non-reasoning model just clutters the toolbar. Flip per-model
+	// in the workspace model editor (or via admin defaults) for command-a-plus,
+	// gpt-5, etc.
+	reasoning: false
 };
 
 export const PASTED_TEXT_CHARACTER_LIMIT = 1000;

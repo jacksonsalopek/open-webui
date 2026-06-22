@@ -3142,6 +3142,7 @@
 									bind:codeInterpreterEnabled
 									{pendingOAuthTools}
 									bind:webSearchEnabled
+									bind:params
 									bind:atSelectedModel
 									bind:showCommands
 									bind:dragged
@@ -3223,6 +3224,7 @@
 									bind:imageGenerationEnabled
 									bind:codeInterpreterEnabled
 									bind:webSearchEnabled
+									bind:params
 									bind:atSelectedModel
 									bind:showCommands
 									bind:dragged
