@@ -1,0 +1,141 @@
+version: 1
+phrases:
+  - name: view-model
+    surface_forms: [view model, viewmodel, view-model, vm]
+    definition: |
+      In MVVM, the presenter layer that exposes properties and commands
+      to a view via data binding without referencing UI types directly.
+    tags: [mvvm, architecture]
+
+  - name: code-behind
+    surface_forms: [code-behind, code behind]
+    definition: |
+      In WinUI and WPF, the partial class file paired with a XAML page
+      that handles UI events and view-specific logic outside the view model.
+    tags: [mvvm, dotnet]
+
+  - name: data-binding
+    surface_forms: [data binding, data-binding, databinding]
+    definition: |
+      The mechanism that synchronizes properties between a view and its
+      view model so UI updates when underlying state changes.
+    tags: [mvvm, dotnet]
+
+  - name: dependency-injection
+    surface_forms: [dependency injection, DI, IoC]
+    definition: |
+      A composition pattern where objects receive their collaborators from
+      an external container rather than constructing them directly.
+    tags: [architecture, dotnet]
+
+  - name: race-condition
+    surface_forms: [race condition]
+    definition: |
+      A defect where program outcome depends on the non-deterministic
+      ordering of concurrent operations on shared state.
+    tags: [concurrency]
+
+  - name: tail-call
+    surface_forms: [tail call, tail-call]
+    definition: |
+      A function call in terminal position whose stack frame can be
+      reused, enabling tail-call optimization by the compiler or runtime.
+    tags: [architecture]
+
+  - name: memory-leak
+    surface_forms: [memory leak, memory-leak]
+    definition: |
+      A defect where allocated memory is never released because references
+      prevent the garbage collector from reclaiming it.
+    tags: [dotnet, perf]
+
+  - name: garbage-collector
+    surface_forms: [garbage collector, GC, garbage-collector]
+    definition: |
+      The runtime subsystem that reclaims heap memory by tracing reachable
+      objects and freeing unreachable allocations.
+    tags: [dotnet]
+
+  - name: factory-pattern
+    surface_forms: [factory pattern, factory-pattern, abstract factory]
+    definition: |
+      A Gang-of-Four creation pattern that encapsulates object construction
+      behind an interface so callers depend on abstractions, not concrete types.
+    tags: [gof-patterns, architecture]
+
+  - name: singleton-pattern
+    surface_forms: [singleton pattern, singleton]
+    definition: |
+      A Gang-of-Four pattern that restricts a class to a single shared
+      instance and provides global access to that instance.
+    tags: [gof-patterns, architecture]
+
+  - name: observer-pattern
+    surface_forms: [observer pattern, pub-sub, publish-subscribe]
+    definition: |
+      A Gang-of-Four pattern where subjects notify registered observers
+      when state changes, decoupling publishers from subscribers.
+    tags: [gof-patterns, architecture]
+
+  - name: circular-dependency
+    surface_forms: [circular dependency, cyclic dependency]
+    definition: |
+      A module or object graph where two or more components depend on each
+      other directly or transitively, blocking clean construction or loading.
+    tags: [architecture, dotnet]
+
+  - name: cancellation-token
+    surface_forms: [cancellation token, CancellationToken, cancellation-token]
+    definition: |
+      A .NET cooperative cancellation signal that lets long-running or async
+      work observe shutdown requests and exit promptly.
+    tags: [dotnet, concurrency]
+
+  - name: async-await
+    surface_forms: [async await, async/await, async-await]
+    definition: |
+      C# syntactic sugar over task-based asynchronous methods that lets
+      callers write non-blocking code without manual callback wiring.
+    tags: [dotnet, concurrency]
+
+  - name: event-loop
+    surface_forms: [event loop, event-loop]
+    definition: |
+      The runtime dispatcher that dequeues and executes callbacks, timers,
+      and I/O completions on a single coordination thread or scheduler.
+    tags: [concurrency, architecture]
+
+  - name: cold-start
+    surface_forms: [cold start, cold-start]
+    definition: |
+      The latency penalty on first invocation when caches, JIT compilation,
+      or model weights are not yet warmed.
+    tags: [perf]
+
+  - name: hot-path
+    surface_forms: [hot path, hot-path, fast path]
+    definition: |
+      A frequently executed code region where micro-optimizations and
+      allocation discipline materially affect overall performance.
+    tags: [perf]
+
+  - name: retry-budget
+    surface_forms: [retry budget, retry-budget]
+    definition: |
+      A bounded resilience policy that caps how many retries a client may
+      attempt before failing fast to protect downstream services.
+    tags: [resilience]
+
+  - name: circuit-breaker
+    surface_forms: [circuit breaker, circuit-breaker]
+    definition: |
+      A resilience pattern that stops calling a failing dependency after
+      repeated errors and periodically probes for recovery.
+    tags: [resilience]
+
+  - name: middleware
+    surface_forms: [middleware, request middleware]
+    definition: |
+      A composable pipeline component that intercepts requests or messages
+      to add cross-cutting behavior such as logging or authentication.
+    tags: [architecture]

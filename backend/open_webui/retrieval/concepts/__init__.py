@@ -1,0 +1,43 @@
+"""Concept knowledge graph — extraction, storage, and retrieval."""
+
+from open_webui.retrieval.concepts.schema import (
+    Artifact,
+    ArtifactKind,
+    Concept,
+    ConceptKind,
+    CoOccursWithProps,
+    DefinesProps,
+    Edge,
+    EdgeType,
+    IsCanonicalAliasOfProps,
+    IsNamedInProps,
+    ReferencesProps,
+    artifact_from_dict,
+    artifact_to_dict,
+    concept_from_dict,
+    concept_to_dict,
+    edge_from_dict,
+    edge_to_dict,
+    edge_with_props,
+)
+
+__all__ = [
+    'Artifact',
+    'ArtifactKind',
+    'Concept',
+    'ConceptKind',
+    'CoOccursWithProps',
+    'DefinesProps',
+    'Edge',
+    'EdgeType',
+    'IsCanonicalAliasOfProps',
+    'IsNamedInProps',
+    'ReferencesProps',
+    'artifact_from_dict',
+    'artifact_to_dict',
+    'concept_from_dict',
+    'concept_to_dict',
+    'edge_from_dict',
+    'edge_to_dict',
+    'edge_with_props',
+]

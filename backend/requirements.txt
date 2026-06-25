@@ -147,6 +147,8 @@ av==14.0.1 # Caution: Set due to FATAL FIPS SELFTEST FAILURE, see discussion htt
 colbert-ai==0.2.22
 
 
+kuzu==0.11.3
+
 ## Tests
 docker~=7.1.0
 pytest~=8.4.1

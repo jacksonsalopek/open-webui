@@ -1,0 +1,247 @@
+version: 1
+codebase: lollipop
+generated_at: 2026-06-25
+description: |
+  Phase 1 acceptance set for the concept knowledge graph. 10 hand-curated
+  developer questions, each verified against the lollipop source. Used by
+  the step-10 acceptance test to gate Phase 1 against vector-only baseline.
+questions:
+  - id: q01_toolbar_clipboard
+    intent: find_symbol
+    difficulty: easy
+    question: "where do we copy the toolbar's result text to the clipboard?"
+    expected_files:
+      - src/Lollipop/ViewModels/ToolbarViewModel.cs
+    expected_concepts:
+      - toolbar
+      - clipboard
+      - copy
+      - result
+    expected_answer_signal:
+      - CopyResult
+      - DataPackage
+      - Clipboard.SetContent
+    notes: |
+      Easy lookup; tests basic symbol retrieval. The CopyResult method has
+      a [RelayCommand] attribute and an XML doc comment which should land
+      cleanly in one chunk via our prefix-gluing implementation. A pure
+      vector RAG would also handle this — the question's role is to anchor
+      the easy end of the difficulty spectrum.
+
+  - id: q02_llm_backend_routing
+    intent: find_symbol
+    difficulty: medium
+    question: "where do we decide whether an LLM call goes to onnx-genai or llama-cpp?"
+    expected_files:
+      - src/Lollipop.Llm/Services/LlmServiceDispatcher.cs
+    expected_concepts:
+      - llm
+      - onnx
+      - llama
+      - runtime
+      - dispatcher
+    expected_answer_signal:
+      - ResolveBackend
+      - llama-cpp
+      - OnnxGenAiLlmService
+    notes: |
+      Medium symbol lookup; answer lives in one file but requires reading
+      the switch expression rather than matching a method name from the
+      question. Vector RAG should retrieve LlmServiceDispatcher.cs; the
+      concept neighborhood (runtime, onnx, llama) helps disambiguate it
+      from the two concrete backend implementations.
+
+  - id: q03_uia_text_pattern
+    intent: find_symbol
+    difficulty: hard
+    question: "where do we read selected text via UIAutomation's text pattern instead of the clipboard trick?"
+    expected_files:
+      - src/Lollipop/Services/SelectionService.cs
+    expected_concepts:
+      - selection
+      - uia
+      - text
+      - pattern
+      - automation
+    expected_answer_signal:
+      - GetCurrentPatternAs
+      - UIA_TextPatternId
+      - TryGetSelectedTextViaUia
+    notes: |
+      Hard lookup: the question uses "UIAutomation text pattern" vocabulary
+      rather than COM interface names. Answer is buried ~300 lines into
+      SelectionService.cs alongside clipboard fallback logic. Concept-
+      anchored retrieval should boost this file via selection + automation
+      co-occurrence even when the query never mentions SelectionService.
+
+  - id: q04_noop_guardrail_caller
+    intent: where_used
+    difficulty: medium
+    question: "who calls LooksLikeNoOp to catch a translation that came back unchanged?"
+    expected_files:
+      - src/Lollipop.Extensions/Extensions/TranslateExtension.cs
+      - src/Lollipop.Llm/Prompting/PromptGuardrails.cs
+    expected_concepts:
+      - guardrail
+      - translate
+      - noop
+      - translation
+    expected_answer_signal:
+      - LooksLikeNoOp
+      - TranslateToLanguage
+      - PromptGuardrails
+    notes: |
+      Reverse lookup from a guardrail helper to its consumer. The definition
+      lives in PromptGuardrails.cs but the call site the question cares about
+      is TranslateExtension.cs (~line 230). Graph references edges should
+      connect no-op + guardrail concepts to both files; vector-only may rank
+      the definition file higher than the caller.
+
+  - id: q05_selection_gesture_handler
+    intent: where_used
+    difficulty: hard
+    question: "after GlobalHookService fires SelectionGestureDetected, what code actually shows the toolbar?"
+    expected_files:
+      - src/Lollipop/App.xaml.cs
+      - src/Lollipop/Services/PopupService.cs
+    expected_concepts:
+      - hook
+      - selection
+      - gesture
+      - toolbar
+      - popup
+    expected_answer_signal:
+      - OnSelectionGesture
+      - SelectionGestureDetected
+      - _popupSvc
+      - Show
+    notes: |
+      Hard where-used spanning three layers: hook event in GlobalHookService,
+      handler + capture orchestration in App.xaml.cs, and PopupService.Show
+      that materializes ToolbarWindow. Pure vector search often lands on
+      GlobalHookService or ToolbarViewModel without connecting the full chain.
+
+  - id: q06_llm_dispatcher_flow
+    intent: explain_region
+    difficulty: medium
+    question: "how does the app pick which LLM runtime backend handles a completion request?"
+    expected_files:
+      - src/Lollipop.Llm/Services/LlmServiceDispatcher.cs
+      - src/Lollipop.Llm/Services/FileSystemModelStore.cs
+    expected_concepts:
+      - llm
+      - dispatcher
+      - runtime
+      - default
+      - model
+    expected_answer_signal:
+      - ActiveBackend
+      - ResolveBackend
+      - GetDefault
+      - Runtime
+    notes: |
+      Explain-region requiring two files: dispatcher reads the installed
+      default model's Runtime field via IModelStore.GetDefault(), then
+      switches on llama-cpp vs onnx-genai. Context packing must include
+      both the routing switch and where Runtime is stored.
+
+  - id: q07_selection_capture_strategies
+    intent: explain_region
+    difficulty: hard
+    question: "how does SelectionService get highlighted text when UIAutomation doesn't have a text pattern?"
+    expected_files:
+      - src/Lollipop/Services/SelectionService.cs
+    expected_concepts:
+      - selection
+      - clipboard
+      - uia
+      - sendinput
+      - capture
+    expected_answer_signal:
+      - TryGetSelectedTextAsync
+      - SendInput
+      - CaptureClipboardSnapshotAsync
+      - PatternSupported
+    notes: |
+      Hard explain-region in a single large file with two distinct strategies.
+      The question names the failure mode (no text pattern) rather than
+      TryGetSelectedTextViaUia — tests whether retrieval assembles the
+      UIA-first / clipboard-round-trip narrative from scattered comments
+      and control flow.
+
+  - id: q08_llm_failure_guardrails
+    intent: find_concept
+    difficulty: easy
+    question: "what's the shared helper for detecting when a small model just echoes the input or chats back instead of transforming it?"
+    expected_files:
+      - src/Lollipop.Llm/Prompting/PromptGuardrails.cs
+      - src/Lollipop.Llm/Prompting/ChatResponsePatterns.cs
+    expected_concepts:
+      - guardrail
+      - prompt
+      - echo
+      - chat
+      - llm
+    expected_answer_signal:
+      - PromptGuardrails
+      - LooksLikeEcho
+      - LooksLikeChatResponse
+      - ContentOnlyRule
+    notes: |
+      Concept-anchored easy question: user knows the failure mode vocabulary
+      (echo, chat response) but not the PromptGuardrails type name. Should
+      benefit from graph centrality on guardrail + prompt concepts. Vector
+      RAG may scatter across WritingToolsExtension aliases and docs.
+
+  - id: q09_floating_selection_toolbar
+    intent: find_concept
+    difficulty: medium
+    question: "what's the thing that pops up near your cursor when you highlight text in another app?"
+    expected_files:
+      - src/Lollipop/Services/GlobalHookService.cs
+      - src/Lollipop/Services/PopupService.cs
+      - src/Lollipop/Windows/ToolbarWindow.xaml.cs
+    expected_concepts:
+      - toolbar
+      - selection
+      - hook
+      - popup
+      - gesture
+    expected_answer_signal:
+      - SelectionGestureDetected
+      - PopupService
+      - ToolbarWindow
+      - ShowAt
+    notes: |
+      Concept-anchored medium question with no anchor symbol in the query.
+      Answer spans hook detection, popup orchestration, and the WS_EX_NOACTIVATE
+      toolbar window. Graph co-occurrence of selection + toolbar + hook should
+      pull the neighborhood; vector-only may return ToolbarViewModel without
+      the Win32 hook / popup wiring.
+
+  - id: q10_add_toolbar_extension
+    intent: generate_code
+    difficulty: easy
+    question: "show me how to add a new button to the floating selection toolbar"
+    expected_files:
+      - src/Lollipop.Extensions/IToolbarExtension.cs
+      - src/Lollipop/App.xaml.cs
+      - docs/platform/integration-guides/llm-extension-integration.md
+    expected_concepts:
+      - extension
+      - toolbar
+      - dependency
+      - injection
+      - execute
+    expected_answer_signal:
+      - IToolbarExtension
+      - Execute
+      - IExtensionContext
+      - AddSingleton
+    notes: |
+      Generate-code easy question: answer pattern is documented in
+      llm-extension-integration.md and mirrored in App.xaml.cs DI
+      registration block. Evaluators check that a generated answer mentions
+      implementing IToolbarExtension, Execute(IExtensionContext), and
+      services.AddSingleton<IToolbarExtension, ...>. Pure vector may return
+      only the interface file without the DI wiring step.
