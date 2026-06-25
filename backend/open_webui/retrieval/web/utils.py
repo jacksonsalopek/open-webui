@@ -1,6 +1,7 @@
 import asyncio
 import ipaddress
 import logging
+import re
 import socket
 import ssl
 import urllib.parse
@@ -986,6 +987,14 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
         timeout: Optional[float] = 15.0,
         output_format: Literal['markdown', 'txt', 'html'] = 'markdown',
         cache_ttl_seconds: Optional[int] = None,
+        query: Optional[str] = None,
+        heading_trim_enabled: bool = True,
+        heading_trim_min_token_len: int = 3,
+        heading_trim_keep_intro: bool = True,
+        js_fallback_enabled: bool = True,
+        js_fallback_min_extract_chars: int = 200,
+        playwright_ws_url: Optional[str] = None,
+        playwright_timeout: Optional[int] = 15000,
     ):
         self.web_paths = web_paths
         self.verify_ssl = verify_ssl
@@ -996,6 +1005,24 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
         self.timeout = timeout
         self.output_format = output_format
         self.cache_ttl_seconds = cache_ttl_seconds
+        # Heading-trim plumbing. ``query`` is the joined-by-space union of
+        # every sub-query in the current batch -- so when the same loader
+        # instance services a 3-query fanout, every heading is matched
+        # against the union of all relevant terms (a page that only matches
+        # one of the three queries still keeps its relevant subtrees).
+        self.query = query or ''
+        self.heading_trim_enabled = heading_trim_enabled
+        self.heading_trim_min_token_len = max(1, heading_trim_min_token_len)
+        self.heading_trim_keep_intro = heading_trim_keep_intro
+        # JS-shell Playwright fallback. ``playwright_ws_url`` carries the
+        # ws:// endpoint of the sidecar (PLAYWRIGHT_WS_URL env) and stays
+        # ``None`` in tests / local dev where there's no sidecar reachable;
+        # the fallback short-circuits to "trafilatura only" in that case
+        # regardless of ``js_fallback_enabled``.
+        self.js_fallback_enabled = js_fallback_enabled
+        self.js_fallback_min_extract_chars = max(0, js_fallback_min_extract_chars)
+        self.playwright_ws_url = playwright_ws_url or None
+        self.playwright_timeout = playwright_timeout
 
     @staticmethod
     def _build_metadata(html: str, url: str) -> Dict[str, Any]:
@@ -1023,8 +1050,219 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
             log.debug(f'trafilatura: metadata extraction failed for {url}: {e}')
         return metadata
 
+    # Markdown heading detector. Matches ATX-style ``# Heading`` / ``## H``
+    # at column zero only — trafilatura's markdown output never indents
+    # headings, and rejecting indented lines avoids matching ``#foo`` in
+    # comments or hash-prefixed lines inside fenced code blocks.
+    _HEADING_RE = re.compile(r'^(#{1,6})\s+(.*\S)\s*$', re.MULTILINE)
+
+    # SPA-shell fingerprints. These are the bare-mount divs that React /
+    # Vue / Next / Nuxt apps render server-side as the only meaningful
+    # body content -- everything else gets injected client-side by JS we
+    # never executed. Substring match (case-insensitive) keeps this
+    # robust against minor markup variations across framework versions.
+    _SPA_ROOT_HINTS = (
+        '<div id="root">',
+        "<div id='root'>",
+        '<div id="app">',
+        "<div id='app'>",
+        '<div id="__next">',
+        "<div id='__next'>",
+        '<div id="__nuxt">',
+        "<div id='__nuxt'>",
+    )
+
+    # Minimum visible-text-to-HTML ratio. SPA shells are mostly inline
+    # script + framework markup; a ratio under 5% almost always means
+    # there's no real text on the server-rendered page.
+    _SPA_TEXT_RATIO_FLOOR = 0.05
+
+    @staticmethod
+    def _looks_js_shell(html: str, extracted_text: str, min_extract_chars: int) -> bool:
+        """Return True iff the HTML looks like an unexecuted SPA shell.
+
+        Triggered when trafilatura came back with empty / very thin
+        content AND the HTML carries one of the canonical SPA mount
+        markers, OR has a substantial <noscript> block, OR the
+        text-to-HTML ratio inside <body> is small enough that no
+        meaningful prose could have been server-rendered.
+        """
+        if not html:
+            return False
+
+        # Quick reject: trafilatura already produced enough content,
+        # so the page isn't a shell even if it also happens to embed
+        # a framework mount div somewhere (e.g. a docs page that ships
+        # a React-powered search widget alongside its real prose).
+        if extracted_text and len(extracted_text) >= min_extract_chars:
+            return False
+
+        html_lower = html.lower()
+        if any(hint in html_lower for hint in SafeTrafilaturaLoader._SPA_ROOT_HINTS):
+            return True
+
+        # <noscript> with substantial content is a strong human-facing
+        # tell ("This site requires JavaScript", "Please enable JS"),
+        # so we treat any noscript block > 50 chars as a shell marker.
+        ns_match = re.search(
+            r'<noscript[^>]*>(.*?)</noscript>', html_lower, re.DOTALL
+        )
+        if ns_match and len(ns_match.group(1).strip()) > 50:
+            return True
+
+        # Text-to-HTML ratio inside <body>. We approximate "text"
+        # by stripping all tags from the body slice -- crude but
+        # adequate as a tie-breaker; we already require an empty /
+        # near-empty trafilatura extract to even get here.
+        body_match = re.search(
+            r'<body[^>]*>(.*?)</body>', html_lower, re.DOTALL
+        )
+        if body_match:
+            body_html = body_match.group(1)
+            stripped = re.sub(r'<[^>]+>', '', body_html)
+            if body_html and (len(stripped.strip()) / max(len(body_html), 1)) < SafeTrafilaturaLoader._SPA_TEXT_RATIO_FLOOR:
+                return True
+
+        return False
+
+    @staticmethod
+    def _tokenize_query(query: str, min_len: int) -> List[str]:
+        """Split a query into lowercased alnum tokens, dropping short stopwordy ones.
+
+        ``min_len`` filters out 1-2 char tokens like ``is`` / ``to`` / ``a``
+        that match almost every English heading and would reduce the trim
+        to a no-op. We keep the order-insensitive ``set`` semantics: any
+        single token match keeps a subtree.
+        """
+        if not query:
+            return []
+        tokens = [t.lower() for t in re.split(r'[^A-Za-z0-9]+', query) if t]
+        return [t for t in tokens if len(t) >= min_len]
+
+    def _heading_trim(self, text: str, query: str) -> str:
+        """Keep only heading subtrees whose heading or body matches ``query``.
+
+        Algorithm:
+          1. Parse all H1..H6 headings (``re.MULTILINE`` over the markdown).
+          2. For each heading, compute the subtree slice (heading line up to
+             the next heading whose depth is <= the current heading's
+             depth). This is the structural unit we keep or drop together.
+          3. Tokenize the query; tokens shorter than the configured floor
+             are discarded so common stopwords don't blanket-match.
+          4. A subtree is "kept" if ANY query token appears (case-insensitive
+             substring) in either the heading text OR the subtree body.
+          5. Optionally ALWAYS keep the page intro: everything up to the
+             first heading (page title + lede paragraph if there is one),
+             plus the first heading's own body when it's the H1, capped at
+             ~500 chars so a giant intro doesn't defeat the trim. This is
+             the safety net that prevents a doc with zero token matches
+             from collapsing to an empty string and disappearing from the
+             citation list entirely.
+
+        Worst-case shrinkage: a long Wikipedia or RTD page with 30+
+        sections typically drops to 20-50% of its original length (the
+        relevant 2-4 sections plus the intro); a short blog post or
+        landing page with all content under H1 or no headings at all
+        stays roughly unchanged. We deliberately tolerate the no-op
+        case rather than aggressively chopping short pages where every
+        section might be relevant context.
+        """
+        if not text or not query:
+            return text
+
+        tokens = self._tokenize_query(query, self.heading_trim_min_token_len)
+        if not tokens:
+            return text
+
+        matches = list(self._HEADING_RE.finditer(text))
+        if not matches:
+            # No structural headings to anchor against -- nothing to trim.
+            return text
+
+        # ``before_first`` is the page intro slice (anything before the
+        # first heading line). On most clean docs this is the page title
+        # markdown that trafilatura emits before any H1 (or the lede
+        # paragraph on news-style pages whose H1 was already consumed as
+        # title metadata).
+        first_start = matches[0].start()
+        before_first = text[:first_start]
+
+        # Pair each heading with its subtree end: the start of the next
+        # heading at depth <= current depth. We walk linearly so this is
+        # O(N) in heading count.
+        subtrees: List[tuple[int, int, int, str, str]] = []
+        for i, m in enumerate(matches):
+            depth = len(m.group(1))
+            heading_text = m.group(2)
+            start = m.start()
+            end = len(text)
+            for j in range(i + 1, len(matches)):
+                next_depth = len(matches[j].group(1))
+                if next_depth <= depth:
+                    end = matches[j].start()
+                    break
+            subtrees.append((start, end, depth, heading_text, text[start:end]))
+
+        # Match each subtree. Substring match is the cheapest reliable
+        # check and matches the user's mental model ("the page mentions
+        # the word `gemma3`"). Lowercase once per body, not per token.
+        kept_ranges: List[tuple[int, int]] = []
+        if self.heading_trim_keep_intro and before_first.strip():
+            # Always keep page intro slice. Cap at 500 chars so an
+            # introductory wall-of-text on a blog post doesn't dilute the
+            # trim's benefit.
+            kept_ranges.append((0, min(len(before_first), 500)))
+
+        for start, end, _, heading_text, body in subtrees:
+            haystack_heading = heading_text.lower()
+            haystack_body = body.lower()
+            if any(t in haystack_heading or t in haystack_body for t in tokens):
+                kept_ranges.append((start, end))
+            elif (
+                self.heading_trim_keep_intro
+                and start == first_start
+                and not kept_ranges
+            ):
+                # If we somehow ended up with zero kept ranges and no
+                # intro slice, take the first heading's subtree (capped
+                # at ~500 chars of body) as a last-resort fallback so
+                # the doc isn't empty. This branch is rare -- it only
+                # triggers when ``before_first`` is whitespace-only and
+                # nothing matches.
+                kept_ranges.append((start, min(end, start + 500)))
+
+        if not kept_ranges:
+            # Pure no-match doc and keep-intro disabled. Return original
+            # rather than empty -- chunk D's compress pass is downstream
+            # and is better positioned to drop irrelevant content than
+            # we are here. ``return text`` is also the safe default if
+            # all our heuristics misfire.
+            return text
+
+        # Merge overlapping / adjacent ranges so we don't double-emit
+        # bytes when a kept subtree slot abuts another kept subtree.
+        kept_ranges.sort()
+        merged: List[tuple[int, int]] = []
+        for s, e in kept_ranges:
+            if merged and s <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], e))
+            else:
+                merged.append((s, e))
+
+        return '\n\n'.join(text[s:e].strip() for s, e in merged if s < e)
+
     def _extract(self, html: str, url: str) -> Optional[Document]:
-        """HTML → trafilatura → Document. Returns ``None`` on empty extraction."""
+        """HTML → trafilatura → Document. Returns ``None`` on empty extraction.
+
+        Post-processing: if ``heading_trim_enabled`` is on and the loader
+        was constructed with a ``query``, walks the markdown headings and
+        keeps only subtrees that match query tokens (see ``_heading_trim``
+        for the algorithm). Trafilatura's ``favor_precision=True`` already
+        drops the obvious nav/footer chrome; this is the second-pass cut
+        that targets *topically irrelevant* subsections (release notes,
+        unrelated docs entries, off-topic stack overflow side threads)
+        which survived the first pass because they LOOK like real content.
+        """
         import trafilatura
 
         try:
@@ -1049,6 +1287,56 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
 
         if not text or not text.strip():
             log.debug(f'trafilatura: empty extraction for {url} (likely JS-rendered)')
+            # When the page looks like an unexecuted SPA shell, return a
+            # sentinel Document with ``needs_js=True`` so alazy_load can
+            # collect the URL and retry it via Playwright. We deliberately
+            # do NOT cache this sentinel in page_cache -- the cache is a
+            # real-content store and we don't want a future search to
+            # serve a stale "needs JS" placeholder.
+            if self.js_fallback_enabled and self._looks_js_shell(
+                html, '', self.js_fallback_min_extract_chars
+            ):
+                metadata = self._build_metadata(html, url)
+                metadata['needs_js'] = True
+                return Document(page_content='', metadata=metadata)
+            return None
+
+        # Trafilatura returned content but it's still tiny -- on SPAs that
+        # ship a server-rendered fragment of the eventual page (e.g. a
+        # title + a "Loading..." placeholder), the extract is non-empty
+        # but useless. Flag those too so the Playwright fallback can try
+        # to do better.
+        if (
+            self.js_fallback_enabled
+            and len(text.strip()) < self.js_fallback_min_extract_chars
+            and self._looks_js_shell(html, text, self.js_fallback_min_extract_chars)
+        ):
+            metadata = self._build_metadata(html, url)
+            metadata['needs_js'] = True
+            # Keep the short body too -- if Playwright fails downstream
+            # we'd rather have the stub than nothing.
+            return Document(page_content=text, metadata=metadata)
+
+        if self.heading_trim_enabled and self.query and self.output_format == 'markdown':
+            try:
+                original_len = len(text)
+                text = self._heading_trim(text, self.query)
+                if original_len and len(text) < original_len:
+                    log.debug(
+                        'heading_trim: %s shrunk from %d to %d chars (%.0f%%)',
+                        url,
+                        original_len,
+                        len(text),
+                        100.0 * len(text) / original_len,
+                    )
+            except Exception as e:
+                # Don't poison a fetched page on a regex/parse edge case.
+                log.debug('heading_trim: skipped for %s due to error: %s', url, e)
+
+        if not text or not text.strip():
+            # Defensive: if the trim somehow emptied the doc, fall back
+            # to None so we don't surface a phantom empty citation.
+            log.debug(f'trafilatura: heading_trim left {url} empty; dropping')
             return None
 
         metadata = self._build_metadata(html, url)
@@ -1086,23 +1374,57 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
                 raise
 
     async def alazy_load(self) -> AsyncIterator[Document]:
-        """Async concurrent fetch + extract. Order-preserving with page_cache."""
+        """Async concurrent fetch + extract. Order-preserving with page_cache.
+
+        Cache strategy is three-tiered:
+
+        1. Fresh cache hit -- ``get_with_validators`` returns content
+           and we short-circuit the HTTP request entirely.
+        2. Stale-with-validators -- we have an ``ETag`` /
+           ``Last-Modified`` from the previous fetch but the TTL has
+           expired. The GET below sends those as ``If-None-Match`` /
+           ``If-Modified-Since``; on a ``304 Not Modified`` we resurrect
+           the cached body via ``get_force`` + ``touch``, paying a tiny
+           round-trip instead of re-downloading.
+        3. Cache miss -- fall through to the normal fetch and capture
+           the response's ``ETag`` / ``Last-Modified`` into the cache
+           on success.
+        """
         cache_ttl = self.cache_ttl_seconds
         cached_docs: Dict[str, Document] = {}
+        # ``stale_validators`` carries the headers we want to send on
+        # the conditional GET for URLs whose body is stale but
+        # validatable. Empty for fresh hits and pure cache misses.
+        stale_validators: Dict[str, Dict[str, str]] = {}
         if page_cache.is_enabled() and (cache_ttl is None or cache_ttl > 0):
             for url in self.web_paths:
-                content = page_cache.get(url, cache_ttl)
+                content, etag, last_modified = page_cache.get_with_validators(
+                    url, cache_ttl
+                )
                 if content is not None:
                     cached_docs[url] = Document(
                         page_content=content,
                         metadata={'source': url, 'cache_hit': True},
                     )
+                elif etag or last_modified:
+                    headers: Dict[str, str] = {}
+                    if etag:
+                        headers['If-None-Match'] = etag
+                    if last_modified:
+                        headers['If-Modified-Since'] = last_modified
+                    stale_validators[url] = headers
             if cached_docs:
                 log.info(
                     'page_cache: serving %d/%d URLs from cache (ttl=%ss)',
                     len(cached_docs),
                     len(self.web_paths),
                     cache_ttl if cache_ttl is not None else page_cache.default_ttl_seconds(),
+                )
+            if stale_validators:
+                log.debug(
+                    'page_cache: %d URL(s) stale-but-validatable; '
+                    'attempting conditional GETs',
+                    len(stale_validators),
                 )
 
         uncached_urls = [u for u in self.web_paths if u not in cached_docs]
@@ -1116,9 +1438,9 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
         max_concurrent = max(1, int(self.requests_per_second or 5))
         semaphore = asyncio.Semaphore(max_concurrent)
 
-        headers: Dict[str, str] = {}
+        base_headers: Dict[str, str] = {}
         if USER_AGENT:
-            headers['User-Agent'] = USER_AGENT
+            base_headers['User-Agent'] = USER_AGENT
 
         ssl_arg: Any = AIOHTTP_CLIENT_SESSION_SSL if self.verify_ssl else False
         connector = aiohttp.TCPConnector(resolver=_SSRFSafeResolver())
@@ -1128,15 +1450,67 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
             session: aiohttp.ClientSession, url: str
         ) -> Optional[Document]:
             async with semaphore:
+                # Merge per-request validator headers (If-None-Match /
+                # If-Modified-Since) on top of the session-level
+                # User-Agent. Build a fresh dict so we never mutate
+                # the session headers across concurrent requests.
+                req_headers = dict(base_headers)
+                req_headers.update(stale_validators.get(url, {}))
                 try:
                     await self._safe_process_url(url)
                     async with session.get(
                         url,
                         ssl=ssl_arg,
                         allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                        headers=req_headers,
                     ) as response:
-                        response.raise_for_status()
-                        html = await response.text()
+                        # 304 Not Modified -- the server confirmed our
+                        # cached body is still valid. Pull it back via
+                        # the TTL-ignoring force-get and touch the
+                        # freshness timestamp so the next search inside
+                        # the TTL window is a plain cache hit.
+                        if response.status == 304:
+                            cached = page_cache.get_force(url)
+                            if cached is not None:
+                                page_cache.touch(url)
+                                log.debug(
+                                    'page_cache: 304 revalidated %s '
+                                    '(saved a full fetch)',
+                                    url,
+                                )
+                                return Document(
+                                    page_content=cached,
+                                    metadata={
+                                        'source': url,
+                                        'cache_hit': True,
+                                        'revalidated': True,
+                                    },
+                                )
+                            # Unusual: server returned 304 but we no
+                            # longer have the body (e.g. cache was
+                            # cleared between the validator-read above
+                            # and this response). Fall back to a fresh
+                            # GET without validators.
+                            log.debug(
+                                'page_cache: 304 for %s but no cached body; '
+                                'doing unconditional re-fetch',
+                                url,
+                            )
+                            async with session.get(
+                                url,
+                                ssl=ssl_arg,
+                                allow_redirects=AIOHTTP_CLIENT_ALLOW_REDIRECTS,
+                                headers=base_headers,
+                            ) as r2:
+                                r2.raise_for_status()
+                                html = await r2.text()
+                                response_etag = r2.headers.get('ETag')
+                                response_last_modified = r2.headers.get('Last-Modified')
+                        else:
+                            response.raise_for_status()
+                            html = await response.text()
+                            response_etag = response.headers.get('ETag')
+                            response_last_modified = response.headers.get('Last-Modified')
                 except Exception as e:
                     if self.continue_on_failure:
                         log.warning(f'Error fetching {url}: {e}')
@@ -1145,17 +1519,27 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
 
                 # Push the (CPU-bound) lxml parse off the event loop.
                 try:
-                    return await run_in_threadpool(self._extract, html, url)
+                    doc = await run_in_threadpool(self._extract, html, url)
                 except Exception as e:
                     if self.continue_on_failure:
                         log.exception(f'Error extracting {url}: {e}')
                         return None
                     raise
+                # Stash the validators on the doc metadata so the
+                # caller's cache-write below can persist them alongside
+                # the content. Doing it via metadata keeps
+                # _fetch_and_extract's return type unchanged.
+                if doc is not None:
+                    if response_etag:
+                        doc.metadata['_response_etag'] = response_etag
+                    if response_last_modified:
+                        doc.metadata['_response_last_modified'] = response_last_modified
+                return doc
 
         async with aiohttp.ClientSession(
             trust_env=self.trust_env,
             connector=connector,
-            headers=headers,
+            headers=base_headers,
             timeout=client_timeout,
         ) as session:
             results = await asyncio.gather(
@@ -1164,14 +1548,111 @@ class SafeTrafilaturaLoader(BaseLoader, RateLimitMixin, URLProcessingMixin):
             )
 
         loaded: Dict[str, Document] = {}
+        needs_js_urls: List[str] = []
         for url, doc in zip(uncached_urls, results):
             if doc is None:
                 continue
             loaded[url] = doc
+            # Strip the private response-validator keys out of metadata
+            # before they hit downstream consumers (citations UI / vector
+            # store). They're only useful to the cache write below.
+            response_etag = doc.metadata.pop('_response_etag', None)
+            response_last_modified = doc.metadata.pop('_response_last_modified', None)
+            # Sentinel "needs JS" docs are kept in ``loaded`` only as a
+            # fallback in case Playwright also fails. We skip caching
+            # them so a future search re-attempts the full pipeline
+            # rather than serving the stub from cache. We also skip
+            # docs returned from the 304 path, which already came out
+            # of the cache (``revalidated=True``).
+            if doc.metadata.get('needs_js'):
+                needs_js_urls.append(url)
+                continue
+            if doc.metadata.get('revalidated'):
+                continue
             try:
-                page_cache.put(url, doc.page_content)
+                page_cache.put(
+                    url,
+                    doc.page_content,
+                    etag=response_etag,
+                    last_modified=response_last_modified,
+                )
             except Exception as e:
                 log.debug('page_cache: write failed for %s: %s', url, e)
+
+        # JS-shell fallback. When trafilatura returned empty / shell-only
+        # docs AND a Playwright sidecar is reachable AND the fallback is
+        # enabled, re-fetch just those URLs through Playwright so the JS
+        # actually runs. The new docs replace the trafilatura sentinels
+        # in the final result; if Playwright also fails to extract, the
+        # original sentinel doc stays (potentially with an empty body)
+        # so the URL still appears in the citation list with at least a
+        # title.
+        if (
+            self.js_fallback_enabled
+            and needs_js_urls
+            and self.playwright_ws_url
+        ):
+            log.info(
+                'trafilatura_js_fallback: %d/%d URLs retried via playwright',
+                len(needs_js_urls),
+                len(uncached_urls),
+            )
+            try:
+                pw_loader = SafePlaywrightURLLoader(
+                    web_paths=needs_js_urls,
+                    verify_ssl=self.verify_ssl,
+                    trust_env=self.trust_env,
+                    # Carry the trafilatura loader's rate-limit / cache
+                    # settings forward so the Playwright pass respects
+                    # the same SafePlaywrightURLLoader semantics it would
+                    # if called directly via get_web_loader.
+                    requests_per_second=self.requests_per_second,
+                    continue_on_failure=self.continue_on_failure,
+                    playwright_ws_url=self.playwright_ws_url,
+                    playwright_timeout=self.playwright_timeout,
+                    cache_ttl_seconds=self.cache_ttl_seconds,
+                )
+                pw_docs: List[Document] = []
+                async for pw_doc in pw_loader.alazy_load():
+                    pw_docs.append(pw_doc)
+                # SafePlaywrightURLLoader's alazy_load handles its own
+                # cache writes for the success cases; we only need to
+                # merge the resulting docs into our final result map.
+                for pw_doc in pw_docs:
+                    src = pw_doc.metadata.get('source')
+                    if not src:
+                        continue
+                    # Apply the heading trim to Playwright output too --
+                    # most Playwright results are plain text (not
+                    # markdown), so the trim degrades to a no-op when no
+                    # headings are found, which is exactly the safe
+                    # behavior we want.
+                    if self.heading_trim_enabled and self.query:
+                        try:
+                            pw_doc.page_content = self._heading_trim(
+                                pw_doc.page_content, self.query
+                            )
+                        except Exception as e:
+                            log.debug(
+                                'heading_trim: skipped Playwright fallback for %s: %s',
+                                src, e,
+                            )
+                    loaded[src] = pw_doc
+            except Exception as e:
+                # A broken Playwright sidecar should not poison the
+                # batch -- we already have trafilatura sentinels in
+                # ``loaded`` for these URLs, so worst case is they
+                # surface with empty bodies (URL + title only).
+                log.warning(
+                    'trafilatura_js_fallback failed; keeping trafilatura stubs: %s',
+                    e,
+                )
+        elif needs_js_urls and not self.playwright_ws_url:
+            log.debug(
+                'trafilatura: %d URL(s) flagged needs_js but PLAYWRIGHT_WS_URL is unset; '
+                'keeping trafilatura stubs',
+                len(needs_js_urls),
+            )
 
         for url in self.web_paths:
             doc = cached_docs.get(url) or loaded.get(url)
@@ -1188,6 +1669,12 @@ def get_web_loader(
     requests_per_second: int = 2,
     trust_env: bool = False,
     cache_ttl_seconds: Optional[int] = None,
+    query: Optional[str] = None,
+    heading_trim_enabled: bool = True,
+    heading_trim_min_token_len: int = 3,
+    heading_trim_keep_intro: bool = True,
+    js_fallback_enabled: bool = True,
+    js_fallback_min_extract_chars: int = 200,
 ):
     # Check if the URLs are valid
     safe_urls = safe_validate_urls([urls] if isinstance(urls, str) else urls)
@@ -1243,6 +1730,27 @@ def get_web_loader(
                 web_loader_args['timeout'] = timeout_value
         if cache_ttl_seconds is not None:
             web_loader_args['cache_ttl_seconds'] = cache_ttl_seconds
+        # Heading-trim plumbing only flows through the trafilatura loader.
+        # The Playwright loader doesn't emit markdown by default (its
+        # default evaluator returns whatever ``page.evaluate`` produces);
+        # if we ever swap that for a markdown-emitting evaluator the
+        # trim can be reused here.
+        if query:
+            web_loader_args['query'] = query
+        web_loader_args['heading_trim_enabled'] = heading_trim_enabled
+        web_loader_args['heading_trim_min_token_len'] = heading_trim_min_token_len
+        web_loader_args['heading_trim_keep_intro'] = heading_trim_keep_intro
+        # JS-shell fallback: pass the Playwright sidecar endpoint and
+        # timeout through so SafeTrafilaturaLoader.alazy_load can spin up
+        # SafePlaywrightURLLoader for just the URLs that came back empty.
+        # When PLAYWRIGHT_WS_URL is unset the fallback short-circuits
+        # internally regardless of js_fallback_enabled.
+        web_loader_args['js_fallback_enabled'] = js_fallback_enabled
+        web_loader_args['js_fallback_min_extract_chars'] = js_fallback_min_extract_chars
+        if PLAYWRIGHT_WS_URL.value:
+            web_loader_args['playwright_ws_url'] = PLAYWRIGHT_WS_URL.value
+        if PLAYWRIGHT_TIMEOUT.value:
+            web_loader_args['playwright_timeout'] = PLAYWRIGHT_TIMEOUT.value
 
     if WEB_LOADER_ENGINE.value == 'firecrawl':
         WebLoaderClass = SafeFireCrawlLoader

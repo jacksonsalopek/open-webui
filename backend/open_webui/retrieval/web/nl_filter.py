@@ -424,6 +424,17 @@ _DEVELOPER_TOPICS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
         ('.net', 'dotnet', 'c#', 'csharp', 'nuget', 'roslyn', 'asp.net'),
         ('learn.microsoft.com', 'devblogs.microsoft.com', 'github.com'),
     ),
+    # ── Game development ─────────────────────────────────────────────────────
+    # Godot Engine. Placed before the web catchall because GDScript and the
+    # engine's class reference are unambiguously primary-source-on-RtD. Plain
+    # "godot " (with trailing space, to avoid matching unrelated words like
+    # "ungodot") covers most queries; specific Godot APIs are exhaustively
+    # routed via :mod:`docs_router` when the user invokes the portal pins.
+    (
+        ('godot ', 'godotengine', 'gdscript', 'godot engine', 'godot 4', 'godot 3'),
+        ('docs.godotengine.org', 'github.com'),
+    ),
+
     # ── Web development ──────────────────────────────────────────────────────
     # Specific frameworks/runtimes come first; the web-platform catchall (MDN /
     # web.dev / WHATWG / W3C) is the very last entry. "react native" / "next"
@@ -549,6 +560,10 @@ _PORTAL_PINS: tuple[tuple[tuple[str, ...], tuple[str, ...]], ...] = (
     (
         ('msdn', 'learn.microsoft'),
         ('learn.microsoft.com', 'devblogs.microsoft.com', 'github.com'),
+    ),
+    (
+        ('godotengine', 'godot engine', 'docs.godotengine', 'gdscript'),
+        ('docs.godotengine.org', 'github.com'),
     ),
 )
 
@@ -684,6 +699,7 @@ def synthesize_datetime_answer(
     current_date: Optional[str] = None,
     current_time: Optional[str] = None,
     current_weekday: Optional[str] = None,
+    user_query: Optional[str] = None,
 ) -> str:
     """Return a human-readable current-date/time blurb suitable for injection
     as a "search result" snippet.
@@ -696,15 +712,27 @@ def synthesize_datetime_answer(
     requiring the IANA tz database in the container. If those are missing we
     fall back to ``ZoneInfo(timezone_name)`` when tzdata is available, then
     finally to the server's local clock.
+
+    When ``user_query`` is provided, it is echoed verbatim into the snippet
+    along with an explicit "reply in the same language" directive. This is
+    the language-anchor fix for command-a-plus W4A4: on very short prompts
+    ("what time is it" = 4 tokens), the heavily-quantized multilingual model
+    sometimes ignored the global RAG template's "respond in the same language
+    as the user's query" guideline and answered in Korean (or another
+    language it has strong training mass for). Echoing the query into the
+    *source* content doubles the language signal in the model's attention
+    window, and the trailing directive wins on recency bias inside the long
+    RAG-template wrapper.
     """
     if current_date and current_time:
         weekday = current_weekday or ''
         date_prefix = f'{weekday}, {current_date}' if weekday else current_date
         tz_label = timezone_name or 'server local time'
-        return (
+        snippet = (
             f"Current date: {date_prefix}.\n"
             f"Current time: {current_time} ({tz_label}).\n"
         )
+        return _append_language_anchor(snippet, user_query)
 
     now: datetime
     tz_label = timezone_name or 'server local time'
@@ -721,8 +749,34 @@ def synthesize_datetime_answer(
     # Strip leading zeros manually so this works everywhere.
     day = str(int(now.strftime('%d')))
     hour12 = str(int(now.strftime('%I')))
-    return (
+    snippet = (
         f"Current date: {now.strftime('%A, %B')} {day}, {now.strftime('%Y')}.\n"
         f"Current time: {hour12}:{now.strftime('%M %p')} ({tz_label}).\n"
         f"ISO 8601: {now.isoformat(timespec='seconds')}."
+    )
+    return _append_language_anchor(snippet, user_query)
+
+
+def _append_language_anchor(snippet: str, user_query: Optional[str]) -> str:
+    """Append a user-query echo + language directive to ``snippet`` if a query
+    was supplied. No-op when ``user_query`` is missing or empty so callers that
+    don't have the query handy (older callers, direct tests) get the bare
+    date/time blurb unchanged.
+
+    Truncates very long queries defensively — the short-circuit path is gated
+    on ``is_pure_datetime_query`` which only matches short whole-query
+    patterns, so this should never fire in practice, but it prevents a
+    pathological caller from blowing up the snippet size.
+    """
+    if not user_query:
+        return snippet
+    q = user_query.strip()
+    if not q:
+        return snippet
+    if len(q) > 200:
+        q = q[:200] + '…'
+    return (
+        f'{snippet.rstrip()}\n\n'
+        f'User question: "{q}"\n'
+        f'Reply in the same language as the user question above.\n'
     )

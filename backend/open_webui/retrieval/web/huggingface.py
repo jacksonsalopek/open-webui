@@ -62,6 +62,47 @@ _VALID_SORTS: frozenset[str] = frozenset(
 )
 _DEFAULT_SORT = 'downloads'
 
+# Allowlist of HF Hub ``pipeline_tag`` values we accept from the upstream
+# router. Bogus tags get the ``pipeline_tag`` param dropped (HF returns
+# zero results for an unknown task instead of falling back gracefully),
+# so we'd rather skip the filter than break the search entirely. This
+# list is the set the router can actually emit via
+# :data:`hf_router._PIPELINE_INTENT`; keep them in sync.
+_VALID_PIPELINE_TAGS: frozenset[str] = frozenset(
+    {
+        'sentence-similarity',
+        'feature-extraction',
+        'text-generation',
+        'text2text-generation',
+        'text-classification',
+        'token-classification',
+        'question-answering',
+        'summarization',
+        'translation',
+        'fill-mask',
+        'zero-shot-classification',
+        'text-to-image',
+        'text-to-speech',
+        'automatic-speech-recognition',
+        'image-text-to-text',
+        'image-classification',
+        'image-to-text',
+        'visual-question-answering',
+        'document-question-answering',
+        'object-detection',
+        'image-segmentation',
+        'depth-estimation',
+        'audio-classification',
+        'audio-to-audio',
+        'voice-activity-detection',
+        'reinforcement-learning',
+        'robotics',
+        'tabular-classification',
+        'tabular-regression',
+        'any-to-any',
+    }
+)
+
 
 def _build_session() -> requests.Session:
     session = requests.Session()
@@ -155,11 +196,19 @@ def search_huggingface(
     search_filter: Optional[WebSearchFilter] = None,
     author: Optional[str] = None,
     sort: Optional[str] = None,
+    pipeline_tag: Optional[str] = None,
 ) -> list[SearchResult]:
     """Search Hugging Face Hub and return up to ``count`` model results.
 
     Args:
         query: Free-text search; sent as the ``search`` param to HF.
+            HF's ``search`` is a substring match against the *model id*
+            (e.g. ``google/gemma-2-9b``), NOT against the model card --
+            long natural-language sentences match nothing, so the
+            upstream :mod:`hf_router` reduces the query to a token list
+            before calling here. Empty / whitespace-only values are
+            dropped (the param is omitted entirely) so ``author`` +
+            ``pipeline_tag`` alone can drive the listing.
         count: Caller-requested result count; final list is trimmed.
         search_filter: Optional NL filter. ``after``/``before`` are applied
             as a local post-filter against each model's ``lastModified``;
@@ -167,10 +216,23 @@ def search_huggingface(
         author: Optional HF org/user slug (e.g. ``google``, ``meta-llama``,
             ``mistralai``). When supplied, scopes the search to that
             author's models -- used by the upstream router when a known
-            open-weights family triggered the route.
+            open-weights family or an explicit org mention triggered the
+            route. Slug is case-sensitive on HF (``Qwen``, ``CohereLabs``,
+            ``Snowflake``).
         sort: Optional sort key (``downloads``, ``likes``, ``lastModified``,
             ``createdAt``). Decided upstream by :mod:`hf_router` from the
             *original* user query. Defaults to ``downloads``.
+        pipeline_tag: Optional HF Hub task tag (``sentence-similarity``,
+            ``text-generation``, ``image-text-to-text``, ...). When
+            supplied, scopes results to that task category server-side;
+            this is the precision lever for queries like "google
+            embedding models" because the alternative -- a substring
+            search for "embedding" against model ids -- misses most of
+            the canonical lineup (``google/embeddinggemma-300m`` etc.
+            don't contain the word ``embedding`` in every form). Bogus
+            values are dropped against :data:`_VALID_PIPELINE_TAGS` so
+            an unknown tag (which HF returns zero results for) can't
+            black-hole the search.
     """
     after = search_filter.after if search_filter is not None else None
     before = search_filter.before if search_filter is not None else None
@@ -178,15 +240,29 @@ def search_huggingface(
     sort_by = sort if sort in _VALID_SORTS else _DEFAULT_SORT
 
     params: dict[str, str | int] = {
-        'search': query,
         'sort': sort_by,
         'direction': '-1',
         'limit': min(
             _LIMIT_HARD_CAP, max(count * 3 if (after or before) else count, 1)
         ),
     }
+    # HF's ``search`` filter is a substring match against the model id.
+    # When the caller (typically :mod:`hf_router`) already pinned the
+    # listing via ``author`` + ``pipeline_tag``, threading an additional
+    # multi-word substring would narrow the result set to ~zero. Drop
+    # the param entirely in that case.
+    search_term = (query or '').strip()
+    if search_term:
+        params['search'] = search_term
     if author:
         params['author'] = author
+    if pipeline_tag and pipeline_tag in _VALID_PIPELINE_TAGS:
+        params['pipeline_tag'] = pipeline_tag
+    elif pipeline_tag:
+        log.debug(
+            'hf: dropping unknown pipeline_tag=%r (not in allowlist)',
+            pipeline_tag,
+        )
 
     log.debug('hf: GET %s params=%s', HF_ENDPOINT, params)
 

@@ -284,6 +284,50 @@ ENABLE_DIRECT_CONNECTIONS = ConfigVar(
     os.getenv('ENABLE_DIRECT_CONNECTIONS', 'False').lower() == 'true',
 )
 
+
+####################################
+# TOOL-USE CAPABLE MODELS
+####################################
+
+# Open WebUI always advertises a small set of executor-backed builtin tools
+# (search_web, fetch_url, request_more_search, ...) to "tool-use-capable"
+# models in the outbound chat-completion `tools` array -- even when the
+# chat-level "Web Search" toggle is OFF. Without an advertised tool the
+# model can still emit an action block in its content (e.g. Cohere
+# Command A+ emits `<|START_ACTION|>[{...}]<|END_ACTION|>`), but the
+# upstream parser (vLLM's `cohere_command4`) bails out when `tools=[]`,
+# the action leaks into `delta.content`, and the chat shows empty content.
+# Advertising the tools flips the parser into structured `tool_calls` mode
+# and lets the existing tool-execution loop dispatch the call.
+#
+# TOOL_USE_CAPABLE_MODELS: CSV of substring or exact match patterns. If
+#   set (non-empty), only models whose id contains at least one of these
+#   patterns are eligible. If unset, falls back to a forward-compatible
+#   regex (gpt-, claude-, gemini-, qwen, command, llama-3/4, deepseek,
+#   mistral).
+# TOOL_USE_CAPABLE_MODELS_DENYLIST: CSV applied AFTER the allowlist.
+#   Always wins. Use to opt-out a specific tool-use-capable model name
+#   without disabling the whole pattern.
+TOOL_USE_CAPABLE_MODELS = ConfigVar(
+    'TOOL_USE_CAPABLE_MODELS',
+    'chat.tool_use.capable_models',
+    [
+        item.strip()
+        for item in os.getenv('TOOL_USE_CAPABLE_MODELS', '').split(',')
+        if item.strip()
+    ],
+)
+
+TOOL_USE_CAPABLE_MODELS_DENYLIST = ConfigVar(
+    'TOOL_USE_CAPABLE_MODELS_DENYLIST',
+    'chat.tool_use.capable_models_denylist',
+    [
+        item.strip()
+        for item in os.getenv('TOOL_USE_CAPABLE_MODELS_DENYLIST', '').split(',')
+        if item.strip()
+    ],
+)
+
 ####################################
 # OLLAMA_BASE_URL
 ####################################
@@ -587,6 +631,55 @@ CODE_INTERPRETER_JUPYTER_TIMEOUT = ConfigVar(
 CODE_INTERPRETER_BLOCKED_MODULES = [
     library.strip() for library in os.getenv('CODE_INTERPRETER_BLOCKED_MODULES', '').split(',') if library.strip()
 ]
+
+# ── Stage 6 runtime audit hooks ─────────────────────────────────────────────
+# PEP 578 ``sys.addaudithook`` instrumentation in
+# ``open_webui/utils/audit_hooks.py``. Default-off because the per-request
+# context (chat_id, user_id, tool_name) is not yet wired through the
+# middleware -- enabling without that would log context-free noise. Flip
+# to True only once the middleware sets ``audit_hooks.set_audit_context``
+# at request start. ``AUDIT_HOOKS_BLOCK_BLOCKED_IMPORTS`` turns import
+# logging into active blocking (raises ``ImportError``) for any module
+# in ``CODE_INTERPRETER_BLOCKED_MODULES``; keep off for observe-only
+# rollouts.
+AUDIT_HOOKS_ENABLED = ConfigVar(
+    'AUDIT_HOOKS_ENABLED',
+    'security.audit_hooks.enabled',
+    os.getenv('AUDIT_HOOKS_ENABLED', 'False').lower() == 'true',
+)
+
+AUDIT_HOOKS_BLOCK_BLOCKED_IMPORTS = ConfigVar(
+    'AUDIT_HOOKS_BLOCK_BLOCKED_IMPORTS',
+    'security.audit_hooks.block_blocked_imports',
+    os.getenv('AUDIT_HOOKS_BLOCK_BLOCKED_IMPORTS', 'False').lower() == 'true',
+)
+
+# ── Stage 0 code-intent classifier ──────────────────────────────────────────
+# Cheap routing primitive in ``open_webui/utils/code_intent.py`` that
+# labels a query as ``find_symbol`` / ``where_used`` / ``explain_region`` /
+# ``generate_code`` / ``generate_and_run`` / ``refactor`` / ``unknown``
+# so upstream code can dispatch on intent before paying the embedding
+# tax. See ``docs/CODE_SAFETY_PIPELINE.md`` for the routing table.
+# Default-off because the primitive is not yet wired into the request
+# flow -- flipping the flag does not change behavior on its own.
+# Empty string for the model means "use ``TASK_MODEL`` at call time".
+CODE_INTENT_CLASSIFIER_ENABLED = ConfigVar(
+    'CODE_INTENT_CLASSIFIER_ENABLED',
+    'rag.code_intent.enabled',
+    os.getenv('CODE_INTENT_CLASSIFIER_ENABLED', 'False').lower() == 'true',
+)
+
+CODE_INTENT_CLASSIFIER_MODEL = ConfigVar(
+    'CODE_INTENT_CLASSIFIER_MODEL',
+    'rag.code_intent.model',
+    os.getenv('CODE_INTENT_CLASSIFIER_MODEL', ''),
+)
+
+CODE_INTENT_CLASSIFIER_TIMEOUT_SECONDS = ConfigVar(
+    'CODE_INTENT_CLASSIFIER_TIMEOUT_SECONDS',
+    'rag.code_intent.timeout_seconds',
+    float(os.getenv('CODE_INTENT_CLASSIFIER_TIMEOUT_SECONDS', '5.0')),
+)
 
 DEFAULT_CODE_INTERPRETER_PROMPT = """
 #### Code Interpreter
@@ -1557,6 +1650,141 @@ WEB_SEARCH_RESULT_COUNT = ConfigVar(
     int(os.getenv('WEB_SEARCH_RESULT_COUNT', '3')),
 )
 
+# Hard cap on follow-up `request_more_search` builtin-tool invocations per
+# chat turn. The chat model can issue this builtin to expand the search when
+# the initial fanout is too thin; this cap prevents runaway loops (a
+# confused model could otherwise spam near-identical queries and burn
+# context + Kagi quota). Set to 0 to disable the builtin entirely; the
+# chat model then has to work with whatever the initial fanout returned.
+WEB_SEARCH_MAX_DEEPENS = ConfigVar(
+    'WEB_SEARCH_MAX_DEEPENS',
+    'rag.web.search.max_deepens',
+    int(os.getenv('WEB_SEARCH_MAX_DEEPENS', '2')),
+)
+
+# ── Heading-aware trafilatura trim ──────────────────────────────────────────
+# After trafilatura extracts a markdown page (favor_precision=True drops the
+# obvious nav/footer chrome), there's still a long tail of off-topic
+# subsections that survived the cut — release-notes pages with two hundred
+# unrelated entries, RTD landing pages with the actual answer buried under
+# "Project Information" / "Contributing" / "License" sections. Most of that
+# bulk never gets cited but does inflate the chat KV cache. The heading
+# trimmer parses markdown headings, computes which ones overlap any
+# tokens from the user's query, and keeps only those subtrees (each kept
+# heading takes its body until the next heading at depth <= its own).
+#
+# WEB_HEADING_TRIM_ENABLED:
+#   Master toggle. False = skip the trim entirely, return the full extract.
+# WEB_HEADING_TRIM_MIN_TOKEN_LEN:
+#   Query tokens shorter than this are ignored. Without this, a one-letter
+#   stopword would match every section ("a" / "is" / "to" all appear in
+#   essentially any English heading), reducing the trim to a no-op.
+# WEB_HEADING_TRIM_KEEP_INTRO:
+#   Always keep the H1 (or first heading) plus a short intro slice, so a
+#   page that has zero heading matches still surfaces *something* and the
+#   chat model has at least the page title for citation context.
+WEB_HEADING_TRIM_ENABLED = ConfigVar(
+    'WEB_HEADING_TRIM_ENABLED',
+    'rag.web.loader.heading_trim.enabled',
+    os.getenv('WEB_HEADING_TRIM_ENABLED', 'True').lower() == 'true',
+)
+
+WEB_HEADING_TRIM_MIN_TOKEN_LEN = ConfigVar(
+    'WEB_HEADING_TRIM_MIN_TOKEN_LEN',
+    'rag.web.loader.heading_trim.min_token_len',
+    int(os.getenv('WEB_HEADING_TRIM_MIN_TOKEN_LEN', '3')),
+)
+
+WEB_HEADING_TRIM_KEEP_INTRO = ConfigVar(
+    'WEB_HEADING_TRIM_KEEP_INTRO',
+    'rag.web.loader.heading_trim.keep_intro',
+    os.getenv('WEB_HEADING_TRIM_KEEP_INTRO', 'True').lower() == 'true',
+)
+
+# ── JS-shell Playwright fallback ────────────────────────────────────────────
+# Trafilatura is the default web loader because it's dramatically faster
+# than Playwright (no Chromium, no WebSocket), but it can't execute
+# JavaScript -- so a modern single-page-app shell comes back empty (just
+# the <div id="root"> placeholder + a <noscript> block telling humans to
+# enable JS). When that happens, we'd rather pay the Playwright cost on
+# just those URLs than drop them from the result set entirely.
+#
+# The detection in SafeTrafilaturaLoader._extract tags candidates with a
+# ``needs_js`` metadata flag (SPA root divs, noscript-heavy bodies, tiny
+# text-to-HTML ratios). At the end of alazy_load we collect those URLs
+# and, if Playwright is reachable AND this flag is on, retry them via
+# SafePlaywrightURLLoader.
+WEB_JS_FALLBACK_ENABLED = ConfigVar(
+    'WEB_JS_FALLBACK_ENABLED',
+    'rag.web.loader.js_fallback.enabled',
+    os.getenv('WEB_JS_FALLBACK_ENABLED', 'True').lower() == 'true',
+)
+
+# Below this many chars of extracted text, a doc is considered "suspicious"
+# and the JS-shell fingerprint check fires. 200 chars catches typical SPA
+# placeholders ("Loading...", "JavaScript is required to view this site")
+# without false-positiving on legitimately short pages (e.g. a 404 stub
+# with real content).
+WEB_JS_FALLBACK_MIN_EXTRACT_CHARS = ConfigVar(
+    'WEB_JS_FALLBACK_MIN_EXTRACT_CHARS',
+    'rag.web.loader.js_fallback.min_extract_chars',
+    int(os.getenv('WEB_JS_FALLBACK_MIN_EXTRACT_CHARS', '200')),
+)
+
+# ── gemma-3-1b per-extract compress pass ────────────────────────────────────
+# After trafilatura + heading trim, each surviving doc is fanned out to
+# gemma-3-1b (always-on, sub-second on the Spark) to compress to an
+# adaptive target length (see retrieval/web/llm_compress.py for the
+# bands and the prompt). Short pages target ~300 tokens, medium ~500,
+# long / code-heavy ~800, with verbatim preservation of code blocks,
+# identifiers, version numbers, and CVE ids. Failure of any single doc
+# falls back to the original (never raises) so the chat surface stays
+# correct even when the Spark is briefly unreachable.
+WEB_SEARCH_COMPRESS_ENABLED = ConfigVar(
+    'WEB_SEARCH_COMPRESS_ENABLED',
+    'rag.web.search.compress.enabled',
+    os.getenv('WEB_SEARCH_COMPRESS_ENABLED', 'True').lower() == 'true',
+)
+
+WEB_SEARCH_COMPRESS_MODEL = ConfigVar(
+    'WEB_SEARCH_COMPRESS_MODEL',
+    'rag.web.search.compress.model',
+    os.getenv('WEB_SEARCH_COMPRESS_MODEL', 'gemma-3-1b'),
+)
+
+WEB_SEARCH_COMPRESS_BASE_URL = ConfigVar(
+    'WEB_SEARCH_COMPRESS_BASE_URL',
+    'rag.web.search.compress.base_url',
+    os.getenv('WEB_SEARCH_COMPRESS_BASE_URL', 'http://litellm:4000/v1'),
+)
+
+WEB_SEARCH_COMPRESS_CONCURRENCY = ConfigVar(
+    'WEB_SEARCH_COMPRESS_CONCURRENCY',
+    'rag.web.search.compress.concurrency',
+    int(os.getenv('WEB_SEARCH_COMPRESS_CONCURRENCY', '6')),
+)
+
+WEB_SEARCH_COMPRESS_TIMEOUT_SECONDS = ConfigVar(
+    'WEB_SEARCH_COMPRESS_TIMEOUT_SECONDS',
+    'rag.web.search.compress.timeout_seconds',
+    int(os.getenv('WEB_SEARCH_COMPRESS_TIMEOUT_SECONDS', '30')),
+)
+
+# ── KB code AST splitter ────────────────────────────────────────────────────
+# When KB ingestion sees a file whose extension maps to a tree-sitter
+# language (see retrieval/loaders/code_splitter.py), the splitter walks
+# the parse tree and emits one chunk per function/class/method instead
+# of the default character / markdown-header pipeline. Prevents the
+# default RecursiveCharacterTextSplitter from cutting in the middle of
+# a function body and feeding the embedder half-functions. Falls back
+# to RecursiveCharacterTextSplitter when the language is unknown, the
+# parse fails, or a single AST node exceeds CHUNK_SIZE.
+KB_CODE_AST_SPLIT_ENABLED = ConfigVar(
+    'KB_CODE_AST_SPLIT_ENABLED',
+    'rag.kb.code.ast_split.enabled',
+    os.getenv('KB_CODE_AST_SPLIT_ENABLED', 'True').lower() == 'true',
+)
+
 
 try:
     web_search_domain_filter_list = json.loads(os.getenv('WEB_SEARCH_DOMAIN_FILTER_LIST', '[]'))
@@ -1741,6 +1969,17 @@ ENABLE_MSLEARN_SEARCH = ConfigVar(
     'ENABLE_MSLEARN_SEARCH',
     'rag.web.search.mslearn.enable',
     os.getenv('ENABLE_MSLEARN_SEARCH', 'True').lower() == 'true',
+)
+
+# Godot Engine docs (Read the Docs project ``godot``). Routed via the same
+# docs router as MDN / MS Learn: bangs ``!godot`` / ``!gdscript`` /
+# ``!godot3`` / ``!godot4`` / ``!godotlatest``, and portal keywords
+# ``godotengine`` / ``gdscript`` / ``docs.godotengine`` / ``godot engine``.
+# Toggle independently of the umbrella ``ENABLE_DOCS_ROUTING`` switch.
+ENABLE_GODOT_SEARCH = ConfigVar(
+    'ENABLE_GODOT_SEARCH',
+    'rag.web.search.godot.enable',
+    os.getenv('ENABLE_GODOT_SEARCH', 'True').lower() == 'true',
 )
 
 # Hugging Face Hub model search. The router fires on:

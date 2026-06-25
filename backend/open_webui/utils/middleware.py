@@ -137,10 +137,12 @@ from open_webui.utils.task import (
 )
 from open_webui.utils.tools import (
     build_tool_server_headers,
+    get_always_on_executor_tools,
     get_builtin_tools,
     get_terminal_tools,
     get_tools,
     get_updated_tool_function,
+    is_tool_use_capable_model,
 )
 from open_webui.utils.webhook import post_webhook
 from starlette.responses import JSONResponse, Response, StreamingResponse
@@ -1878,6 +1880,14 @@ async def chat_web_search_handler(request: Request, form_data: dict, extra_param
             current_date=variables.get('{{CURRENT_DATE}}'),
             current_time=variables.get('{{CURRENT_TIME}}'),
             current_weekday=variables.get('{{CURRENT_WEEKDAY}}'),
+            # Echo the user's query into the synthetic source so the model gets
+            # a strong language anchor. Without this, command-a-plus W4A4 would
+            # occasionally answer in Korean to a 4-token English prompt -- the
+            # global RAG template's "respond in the same language" guideline
+            # got drowned out by the rest of the system prompt on very short
+            # turns. See synthesize_datetime_answer's docstring for the full
+            # rationale.
+            user_query=user_message,
         )
         log.debug(
             'chat_web_search_handler: short-circuited datetime query=%r tz=%s',
@@ -3468,6 +3478,37 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 if name not in tools_dict:
                     tools_dict[name] = tool_dict
 
+            # ── Always-on executor-backed tools ──────────────────────────
+            # For tool-use-capable models, advertise search_web/fetch_url/
+            # request_more_search even when the chat-level Web Search
+            # toggle is OFF. Skipping this is what makes vLLM's
+            # cohere_command4 parser fall through to plain text and leak
+            # `<|START_ACTION|>...<|END_ACTION|>` into delta.content -- we
+            # need a non-empty `tools` array on the outbound request to
+            # flip the parser into structured tool_calls mode. Additive
+            # only: tools already in tools_dict (from the gated builtin
+            # path above or from explicit user opt-ins) win.
+            model_id_for_capability = form_data.get('model') or model.get('id') or ''
+            if is_tool_use_capable_model(model_id_for_capability, request.app.state.config):
+                try:
+                    always_on_tools = await get_always_on_executor_tools(
+                        request,
+                        {
+                            **extra_params,
+                            '__event_emitter__': event_emitter,
+                        },
+                        model,
+                    )
+                    for name, tool_dict in always_on_tools.items():
+                        if name not in tools_dict:
+                            tools_dict[name] = tool_dict
+                except Exception as e:
+                    log.exception(
+                        'Failed to inject always-on executor tools for model %s: %s',
+                        model_id_for_capability,
+                        e,
+                    )
+
         if tools_dict:
             # Always store resolved tools in metadata so downstream consumers
             # (e.g. pipe functions) can access all tools including MCP and builtins.
@@ -3480,6 +3521,19 @@ async def process_chat_payload(request, form_data, user, metadata, model):
                 ]
                 if inlet_filter_tools:
                     form_data['tools'].extend(inlet_filter_tools)
+                # vLLM's auto-tool-choice parsers (cohere_command4, hermes, etc.)
+                # behave most reliably when `tool_choice` is set explicitly. With
+                # tools advertised but tool_choice unset, some upstreams still
+                # short-circuit; `auto` keeps the model free to answer in plain
+                # text when no tool fits. Re-derive the model id here because
+                # the native-FC builtin block above may have been skipped
+                # (e.g. when `builtin_tools` capability is disabled but tools
+                # still arrive via the MCP / tool_ids paths).
+                _tc_model_id = form_data.get('model') or model.get('id') or ''
+                if form_data['tools'] and is_tool_use_capable_model(
+                    _tc_model_id, request.app.state.config
+                ):
+                    form_data.setdefault('tool_choice', 'auto')
             else:
                 # If the function calling is not native, then call the tools function calling handler
                 try:

@@ -1202,6 +1202,32 @@ async def generate_chat_completion(
                     part.get('text', '') for part in message['content'] if part.get('type') in ('input_text', 'text')
                 )
 
+    # Attach outbound chat-completion attributes to the active OTel span so we
+    # can answer "how many tools were advertised to the model on this turn?"
+    # from Jaeger. Skip background tasks (title/follow-up/tag/etc.) to keep the
+    # signal focused on user-facing turns and avoid span pollution.
+    if metadata is None or not metadata.get('task'):
+        try:
+            from opentelemetry import trace as _otel_trace
+
+            _span = _otel_trace.get_current_span()
+            if _span is not None and _span.is_recording():
+                _tools = payload.get('tools') or []
+                _span.set_attribute(
+                    'chat.request.tools_count',
+                    len(_tools) if isinstance(_tools, list) else 0,
+                )
+                _tool_choice = payload.get('tool_choice')
+                if _tool_choice is not None:
+                    _span.set_attribute(
+                        'chat.request.tool_choice',
+                        _tool_choice if isinstance(_tool_choice, str) else 'object',
+                    )
+                _span.set_attribute('chat.request.model', payload.get('model', ''))
+                _span.set_attribute('chat.request.stream', bool(payload.get('stream', False)))
+        except Exception as _otel_exc:
+            log.debug('Failed to set OTel chat.request.* attributes: %s', _otel_exc)
+
     payload = json.dumps(payload)
 
     r = None

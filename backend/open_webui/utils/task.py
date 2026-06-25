@@ -9,6 +9,7 @@ from typing import Any, Optional
 
 from open_webui.config import DEFAULT_RAG_TEMPLATE
 from open_webui.utils.misc import get_last_user_message, get_messages_content
+from open_webui.utils.stack_inventory import get_stack_inventory
 from open_webui.utils.weather import get_current_weather
 
 log = logging.getLogger(__name__)
@@ -112,6 +113,17 @@ async def prompt_template(template: str, user: Optional[Any] = None) -> str:
     # blocking ``requests`` calls don't pin the event loop. The feature
     # is gated by ``ENABLE_WEATHER_PROMPT_VAR`` (default on) so admins
     # can disable network egress per-deployment without editing prompts.
+    # Stack inventory: the chat model has no awareness of the parallel
+    # specialty search routers (!arxiv, !mdn, !mslearn, !godot, !hf, !bb),
+    # the Kagi lens config, the always-on task model, or the embedding
+    # route -- those fire on keyword/bang triggers in the user's text
+    # rendered upstream in routers/retrieval.py, the model never sees them.
+    # Substituting a terse one-line-per-route inventory gives the model
+    # agency to suggest the right bang. Pure substitution -- no network
+    # calls, no async work, process-lifetime cache inside get_stack_inventory().
+    if '{{STACK_INVENTORY}}' in template:
+        template = template.replace('{{STACK_INVENTORY}}', get_stack_inventory())
+
     if '{{CURRENT_WEATHER}}' in template:
         if (os.getenv('ENABLE_WEATHER_PROMPT_VAR', 'True') or 'True').lower() == 'true':
             loc = USER_VARIABLES.get('location') or ''

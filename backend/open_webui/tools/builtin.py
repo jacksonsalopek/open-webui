@@ -41,7 +41,15 @@ from open_webui.routers.memories import (
 from open_webui.routers.memories import (
     add_memory as _add_memory,
 )
-from open_webui.routers.retrieval import search_web as _search_web
+from open_webui.routers.retrieval import (
+    SearchForm,
+    process_web_search as _process_web_search,
+    search_web as _search_web,
+)
+from open_webui.retrieval.web.nl_filter import (
+    is_pure_datetime_query,
+    synthesize_datetime_answer,
+)
 from open_webui.utils.sanitize import sanitize_code
 
 log = logging.getLogger(__name__)
@@ -224,6 +232,30 @@ async def search_web(
     if __request__ is None:
         return json.dumps({'error': 'Request context not available'})
 
+    # Datetime short-circuit. Mirrors ``chat_web_search_handler``'s short-circuit
+    # in utils/middleware.py so the auto-RAG path (function_calling != 'native')
+    # and the native-tool path (function_calling == 'native', the path
+    # command-a-plus actually takes via cohere_command4) converge on identical
+    # behavior. Without this branch, native FC sends "what time is it" to
+    # Kagi, which returns generic Korean/Chinese/Japanese/English worldtime
+    # pages, and the model parrots whichever language dominated the snippets.
+    # The user-query echo + trailing language anchor inside
+    # ``synthesize_datetime_answer`` keeps the response in the user's language.
+    if is_pure_datetime_query(query):
+        tz_name = __user__.get('timezone') if __user__ else None
+        answer = synthesize_datetime_answer(tz_name, user_query=query)
+        log.debug('search_web: short-circuited datetime query=%r tz=%s', query, tz_name)
+        return json.dumps(
+            [
+                {
+                    'title': 'System clock',
+                    'link': 'urn:open-webui:system-clock',
+                    'snippet': answer,
+                }
+            ],
+            ensure_ascii=False,
+        )
+
     try:
         engine = __request__.app.state.config.WEB_SEARCH_ENGINE
         user = UserModel(**__user__) if __user__ else None
@@ -276,6 +308,153 @@ async def fetch_url(
     except Exception as e:
         log.warning(f'fetch_url error: {e}')
         return json.dumps({'error': str(e)})
+
+
+async def request_more_search(
+    query: str,
+    __request__: Request = None,
+    __user__: dict = None,
+) -> str:
+    """
+    Run an additional web search through the full fanout pipeline (Kagi +
+    specialty portals like arXiv, MDN, Microsoft Learn, Godot, HuggingFace,
+    Bitbucket — whichever match the query), load and extract the result
+    pages, and return their full contents as a single tool result.
+
+    Use this when the initial web-search results that were injected into
+    the conversation context don't cover what you need to answer
+    accurately — e.g. the user asked about a specific symbol, a version,
+    a CVE id, or a niche technical phrase and the initial fanout missed
+    the canonical source. Issue a NEW, MORE SPECIFIC query than the one
+    that produced the initial results (use exact symbol names, version
+    numbers, or a `site:<host>` operator); a near-synonym of the
+    original query collapses to the same URLs after dedup and wastes the
+    deepen budget.
+
+    Each chat turn has a hard cap on how many times this tool may be
+    invoked (WEB_SEARCH_MAX_DEEPENS, default 2). Past the cap, the call
+    returns an error message and you must answer with what you already
+    have.
+
+    :param query: The follow-up search query (5-12 words, keyword-dense,
+        preserves specific terms / proper nouns / numbers from the user's
+        question; use a `site:` operator to narrow to a known canonical host).
+    :return: Concatenated extracted markdown of the loaded pages, one
+        section per URL, with the URL and title as a header. Or a JSON
+        error string when the deepen cap is exhausted or the search fails.
+    """
+    if __request__ is None:
+        return json.dumps({'error': 'Request context not available'})
+
+    if not getattr(__request__.app.state.config, 'ENABLE_WEB_SEARCH', False):
+        return json.dumps({'error': 'Web search is disabled for this deployment.'})
+
+    # Per-request deepen counter. Lives on ``request.state`` so it's
+    # scoped to a single chat turn (one HTTP request = one
+    # process_chat_payload pass = at most one chat completion + tool loop).
+    # Threading it through extra_params would also work but request.state
+    # is what the rest of the retrieval pipeline already uses for
+    # per-turn flags (see ``web_page_cache_recency_hint``).
+    cap = int(getattr(__request__.app.state.config, 'WEB_SEARCH_MAX_DEEPENS', 2) or 0)
+    if cap <= 0:
+        return json.dumps(
+            {'error': 'request_more_search is disabled (WEB_SEARCH_MAX_DEEPENS=0).'}
+        )
+
+    state = __request__.state
+    current = int(getattr(state, 'web_deepen_count', 0) or 0)
+    if current >= cap:
+        return json.dumps(
+            {
+                'error': (
+                    f'Deepen cap exhausted ({current}/{cap}). Answer with the '
+                    'sources already in context; do not call request_more_search again this turn.'
+                )
+            }
+        )
+    state.web_deepen_count = current + 1
+
+    cleaned_query = (query or '').strip()
+    if not cleaned_query:
+        return json.dumps({'error': 'query is required and must be non-empty.'})
+
+    user = UserModel(**__user__) if __user__ else None
+
+    try:
+        result = await _process_web_search(
+            __request__,
+            SearchForm(queries=[cleaned_query]),
+            user=user,
+        )
+    except Exception as e:
+        log.exception(f'request_more_search: process_web_search failed: {e}')
+        return json.dumps({'error': f'web search failed: {e}'})
+
+    if not result:
+        return json.dumps({'results': [], 'note': 'No results found for this query.'})
+
+    # Two response shapes depending on BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL:
+    #   * docs path: ``{ 'docs': [{ content, metadata }, ...], 'filenames': [...] }``
+    #   * vector path: ``{ 'collection_names': [...], 'filenames': [...] }``
+    # We only inline doc bodies in the bypass case. In the vector case the
+    # docs are in the vector store and the chat model will need to query
+    # the collection through the knowledge-base tools -- returning the URL
+    # list lets the model decide whether to fetch_url individual entries.
+    docs = result.get('docs') or []
+    urls = result.get('filenames') or []
+    items = result.get('items') or []
+
+    if docs:
+        # Truncate per-doc to keep one deepen from blowing the context window.
+        # Mirrors WEB_FETCH_MAX_CONTENT_LENGTH used by fetch_url; same default
+        # behavior (no cap) so we don't surprise an operator who tuned the
+        # other knob. When chunk #1a (gemma-3-1b compress) lands, the docs
+        # arriving here are already compressed, so this truncation becomes
+        # near-unreachable in practice.
+        max_per_doc = getattr(
+            __request__.app.state.config, 'WEB_FETCH_MAX_CONTENT_LENGTH', None
+        )
+        sections: list[str] = []
+        for idx, doc in enumerate(docs, start=1):
+            content = (doc or {}).get('content') or ''
+            metadata = (doc or {}).get('metadata') or {}
+            source = metadata.get('source') or metadata.get('link') or f'result-{idx}'
+            title = metadata.get('title') or source
+            if max_per_doc and max_per_doc > 0 and len(content) > max_per_doc:
+                content = content[:max_per_doc] + '\n\n[Content truncated...]'
+            sections.append(f'## [{idx}] {title}\n<{source}>\n\n{content.strip()}')
+        body = '\n\n---\n\n'.join(sections)
+        header = (
+            f'request_more_search returned {len(docs)} document(s) for query: {cleaned_query!r} '
+            f'(deepen {state.web_deepen_count}/{cap}).'
+        )
+        return f'{header}\n\n{body}' if body.strip() else header
+
+    # Vector-store path: surface URLs + snippets only; model can fetch_url.
+    return json.dumps(
+        {
+            'query': cleaned_query,
+            'deepen_count': state.web_deepen_count,
+            'deepen_cap': cap,
+            'collection_names': result.get('collection_names') or [],
+            'urls': urls,
+            'items': [
+                {
+                    'title': it.get('title'),
+                    'link': it.get('link'),
+                    'snippet': it.get('snippet'),
+                }
+                for it in items
+                if isinstance(it, dict)
+            ],
+            'note': (
+                'Documents were embedded into the vector store; use the '
+                'knowledge-base / query tools (or fetch_url on a specific URL) '
+                'to read their contents.'
+            ),
+        },
+        ensure_ascii=False,
+    )
 
 
 # =============================================================================

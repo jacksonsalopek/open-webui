@@ -51,7 +51,26 @@ RUN --mount=type=cache,target=/root/.local/share/pnpm/store \
     corepack prepare pnpm@9.6.0 --activate && \
     pnpm install --frozen-lockfile
 
-COPY . .
+# Frontend build inputs ONLY. `pnpm run build` (= vite build) only reads from
+# the Svelte source tree, the static assets, and the build-tool configs.
+# Listing them explicitly (instead of a blanket `COPY . .`) means a pure
+# backend edit -- e.g. open_webui/utils/middleware.py -- doesn't invalidate
+# this layer, so `pnpm run build` keeps its previous on-disk output and the
+# `vite build` step skips entirely on the next `docker compose up --build`.
+# Wall-clock saving on the dev edit-rebuild loop: ~80-110s (frontend build is
+# the dominant non-cached step once dependency caches are warm).
+#
+# Add a new line here when you introduce a new top-level frontend input
+# (e.g. a new config file). Anything not listed here is invisible to the
+# frontend stage; if `vite build` starts failing with a missing-file error
+# after a code change, that's the most likely cause.
+COPY src ./src
+COPY static ./static
+COPY scripts ./scripts
+COPY svelte.config.js vite.config.ts tailwind.config.js postcss.config.js \
+     tsconfig.json i18next-parser.config.ts biome.json \
+     CHANGELOG.md \
+     ./
 ENV APP_BUILD_HASH=${BUILD_HASH}
 RUN pnpm run build
 

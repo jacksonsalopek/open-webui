@@ -54,6 +54,14 @@ langchain-community==0.4.1
 langchain-classic==1.0.1
 langchain-text-splitters==1.1.1
 
+# AST-aware splitter for KB code files. Pre-compiled tree-sitter
+# grammars for ~300 languages in a single wheel; used by
+# open_webui/retrieval/loaders/code_splitter.py to align KB chunks to
+# function/class/method boundaries instead of letting the default
+# RecursiveCharacterTextSplitter shred them mid-body. Falls back to
+# the default splitter on unknown extensions or parse failures.
+tree-sitter-language-pack==1.8.1
+
 fake-useragent==2.2.0
 chromadb==1.5.2
 weaviate-client==4.20.3

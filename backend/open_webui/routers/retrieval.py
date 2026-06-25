@@ -92,6 +92,7 @@ from open_webui.retrieval.web.kagi import search_kagi
 from open_webui.retrieval.web.kagi_lenses import route_query as route_kagi_lens
 from open_webui.retrieval.web.mdn import search_mdn
 from open_webui.retrieval.web.mslearn import search_mslearn
+from open_webui.retrieval.web.godot import search_godot
 from open_webui.retrieval.web.main import SearchResult
 from open_webui.retrieval.web.nl_filter import (
     WebSearchFilter,
@@ -1243,6 +1244,63 @@ def save_docs_to_vector_db(
                     raise ValueError(ERROR_MESSAGES.DUPLICATE_CONTENT)
 
     if split:
+        # AST-aware code splitting. If every doc in this batch shares a
+        # filename whose extension maps to a tree-sitter language, walk
+        # the parse tree and emit one chunk per function/class/method
+        # instead of the default character / markdown-header pipeline.
+        # The default chunkers cut in the middle of function bodies,
+        # which destroys retrieval quality for code (the embedder sees
+        # half-functions with no signature). On a parse failure or
+        # unknown extension, ``split_code`` returns an empty list and
+        # we fall through to the existing pipeline below.
+        if (
+            getattr(request.app.state.config, 'KB_CODE_AST_SPLIT_ENABLED', True)
+            and docs
+        ):
+            from open_webui.retrieval.loaders.code_splitter import (
+                ext_to_language,
+                split_code,
+            )
+
+            # Resolve filename / source for language detection. We try
+            # the canonical metadata keys in the order they're most
+            # likely to carry the actual filename (name = original
+            # upload, title = derived, source = often a URL).
+            def _doc_filename(d: Document) -> str:
+                md = getattr(d, 'metadata', {}) or {}
+                return str(md.get('name') or md.get('title') or md.get('source') or '')
+
+            languages = {ext_to_language(_doc_filename(d)) for d in docs}
+            # Only take the AST path when ALL docs in the batch agree
+            # on a single non-None language. A mixed batch (e.g. a doc
+            # carrying its own README ingested alongside code) would
+            # otherwise have the README mis-routed through a Python
+            # parser.
+            if len(languages) == 1 and (lang := next(iter(languages))):
+                code_chunks: list[Document] = []
+                for doc in docs:
+                    chunks = split_code(
+                        doc.page_content,
+                        lang,
+                        chunk_size=request.app.state.config.CHUNK_SIZE,
+                        chunk_overlap=request.app.state.config.CHUNK_OVERLAP,
+                        base_metadata=dict(doc.metadata or {}),
+                    )
+                    code_chunks.extend(chunks)
+                if code_chunks:
+                    log.info(
+                        'code_splitter: %d AST chunks for language=%s (%d docs in)',
+                        len(code_chunks), lang, len(docs),
+                    )
+                    # AST splitter handled this batch end-to-end.
+                    # Skip the markdown-header + recursive-character
+                    # pipeline below by jumping past the splitting
+                    # block via the early-bind to ``docs`` and the
+                    # ``split = False``-ish state machine.
+                    docs = code_chunks
+                    split = False  # short-circuit the rest of the split branch
+
+    if split:
         if request.app.state.config.ENABLE_MARKDOWN_HEADER_TEXT_SPLITTER:
             log.info('Using markdown header text splitter')
             # Define headers to split on - covering most common markdown header levels
@@ -1735,8 +1793,10 @@ class _EnginePlan(NamedTuple):
     lens_id: Optional[str] = None
     arxiv_category: Optional[str] = None
     mslearn_product: Optional[str] = None
+    godot_version: Optional[str] = None
     hf_author: Optional[str] = None
     hf_sort: Optional[str] = None
+    hf_pipeline_tag: Optional[str] = None
     # Bitbucket: workspace is pulled from app.state.config at dispatch time
     # (so a config change without a restart takes effect immediately).
     # repo_slug is the second half of a `workspace/reposlug` reference; when
@@ -1844,12 +1904,17 @@ async def _build_dispatch_plan(
             ) or (
                 docs.engine == 'mslearn'
                 and getattr(config, 'ENABLE_MSLEARN_SEARCH', True)
+            ) or (
+                docs.engine == 'godot'
+                and getattr(config, 'ENABLE_GODOT_SEARCH', True)
             )
             if portal_enabled:
                 log.debug(
-                    "search_web: docs routing → %s (product=%s); query=%r cleaned=%r exclusive=%s",
+                    "search_web: docs routing → %s (product=%s version=%s); "
+                    "query=%r cleaned=%r exclusive=%s",
                     docs.engine,
                     docs.product,
+                    docs.version,
                     query,
                     docs.query,
                     docs.exclusive,
@@ -1859,6 +1924,7 @@ async def _build_dispatch_plan(
                         engine=docs.engine,
                         query=docs.query,
                         mslearn_product=docs.product,
+                        godot_version=docs.version,
                     )
                 ]
                 if not docs.exclusive and fanout_enabled:
@@ -1890,6 +1956,7 @@ async def _build_dispatch_plan(
                     query=hf.query,
                     hf_author=hf.author,
                     hf_sort=hf.sort,
+                    hf_pipeline_tag=hf.pipeline_tag,
                 )
             ]
             if not hf.exclusive and fanout_enabled:
@@ -2023,8 +2090,10 @@ async def _run_plan(
                 lens_id=entry.lens_id,
                 arxiv_category=entry.arxiv_category,
                 mslearn_product=entry.mslearn_product,
+                godot_version=entry.godot_version,
                 hf_author=entry.hf_author,
                 hf_sort=entry.hf_sort,
+                hf_pipeline_tag=entry.hf_pipeline_tag,
                 bb_repo_slug=entry.bb_repo_slug,
             )
         except Exception as e:
@@ -2163,8 +2232,10 @@ async def _dispatch_web_search(
     lens_id: Optional[str] = None,
     arxiv_category: Optional[str] = None,
     mslearn_product: Optional[str] = None,
+    godot_version: Optional[str] = None,
     hf_author: Optional[str] = None,
     hf_sort: Optional[str] = None,
+    hf_pipeline_tag: Optional[str] = None,
     bb_repo_slug: Optional[str] = None,
 ) -> list[SearchResult]:
     """Dispatch a web search query to the configured engine and return results.
@@ -2213,6 +2284,15 @@ async def _dispatch_web_search(
             mslearn_product,
         )
 
+    if engine == 'godot':
+        return await asyncio.to_thread(
+            search_godot,
+            query,
+            request.app.state.config.WEB_SEARCH_RESULT_COUNT,
+            search_filter,
+            godot_version,
+        )
+
     if engine == 'huggingface':
         return await asyncio.to_thread(
             search_huggingface,
@@ -2221,6 +2301,7 @@ async def _dispatch_web_search(
             search_filter,
             hf_author,
             hf_sort,
+            hf_pipeline_tag,
         )
 
     if engine == 'bitbucket':
@@ -2248,11 +2329,12 @@ async def _dispatch_web_search(
         )
 
     # This fork only supports Kagi + the subject-specific portal adapters
-    # (arXiv / MDN / MS Learn / Hugging Face / Bitbucket); legacy engines
-    # are intentionally unsupported.
+    # (arXiv / MDN / MS Learn / Godot / Hugging Face / Bitbucket); legacy
+    # engines are intentionally unsupported.
     raise Exception(
         f'Unsupported web search engine: {engine!r} '
-        '(supported: "kagi", "arxiv", "mdn", "mslearn", "huggingface", "bitbucket")'
+        '(supported: "kagi", "arxiv", "mdn", "mslearn", "godot", '
+        '"huggingface", "bitbucket")'
     )
 
 
@@ -2424,16 +2506,76 @@ async def process_web_search(request: Request, form_data: SearchForm, user=Depen
                     'process_web_search: recency intent detected, page cache TTL=%ss',
                     cache_ttl_override,
                 )
+            # Plumb the full set of sub-queries into the loader so the
+            # heading-trim post-processor (see SafeTrafilaturaLoader._extract)
+            # can match on the union of every query term in the batch.
+            # Joining with spaces is fine -- the trimmer tokenizes via a
+            # non-alnum regex so "[query A] [query B]" is indistinguishable
+            # from "query A B" for matching purposes.
+            heading_trim_query = ' '.join(form_data.queries or [])
             loader = get_web_loader(
                 urls,
                 verify_ssl=request.app.state.config.ENABLE_WEB_LOADER_SSL_VERIFICATION,
                 requests_per_second=request.app.state.config.WEB_LOADER_CONCURRENT_REQUESTS,
                 trust_env=request.app.state.config.WEB_SEARCH_TRUST_ENV,
                 cache_ttl_seconds=cache_ttl_override,
+                query=heading_trim_query,
+                heading_trim_enabled=getattr(
+                    request.app.state.config, 'WEB_HEADING_TRIM_ENABLED', True
+                ),
+                heading_trim_min_token_len=getattr(
+                    request.app.state.config, 'WEB_HEADING_TRIM_MIN_TOKEN_LEN', 3
+                ),
+                heading_trim_keep_intro=getattr(
+                    request.app.state.config, 'WEB_HEADING_TRIM_KEEP_INTRO', True
+                ),
+                js_fallback_enabled=getattr(
+                    request.app.state.config, 'WEB_JS_FALLBACK_ENABLED', True
+                ),
+                js_fallback_min_extract_chars=getattr(
+                    request.app.state.config, 'WEB_JS_FALLBACK_MIN_EXTRACT_CHARS', 200
+                ),
             )
             t_load = time.perf_counter()
             docs = await loader.aload()
             _mark('load', t_load)
+
+            # Per-doc gemma-3-1b compress pass. Only meaningful on the
+            # bypass-embedding path -- when web docs go straight into
+            # chat context, the compress pass slashes input tokens
+            # without losing citation fidelity (the original source URL
+            # is preserved on each compressed doc's metadata). On the
+            # vector-store path the chunker + reranker already does
+            # the equivalent narrowing, so skipping the LLM call there
+            # avoids paying the latency twice.
+            if (
+                request.app.state.config.BYPASS_WEB_SEARCH_EMBEDDING_AND_RETRIEVAL
+                and getattr(
+                    request.app.state.config, 'WEB_SEARCH_COMPRESS_ENABLED', True
+                )
+                and docs
+            ):
+                from open_webui.retrieval.web.llm_compress import compress_docs
+
+                t_compress = time.perf_counter()
+                compress_query = ' '.join(form_data.queries or [])
+                try:
+                    docs = await compress_docs(
+                        docs,
+                        compress_query,
+                        request=request,
+                    )
+                except Exception as e:
+                    # compress_docs is documented as never raising, but
+                    # we keep this last-resort guard so a bug in the
+                    # compressor can never tank a search. The original
+                    # docs from ``loader.aload()`` are already in
+                    # ``docs`` if we reach this branch (the exception
+                    # would only fire from import errors or similar).
+                    log.warning(
+                        'compress_docs raised unexpectedly; using uncompressed docs: %s', e
+                    )
+                _mark('compress', t_compress)
 
         urls = [
             doc.metadata.get('source') for doc in docs if doc.metadata.get('source')

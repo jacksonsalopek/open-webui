@@ -69,6 +69,7 @@ from open_webui.tools.builtin import (
     query_knowledge_files,
     replace_memory_content,
     replace_note_content,
+    request_more_search,
     search_calendar_events,
     search_channel_messages,
     search_channels,
@@ -540,6 +541,15 @@ async def get_builtin_tools(
     ):
         builtin_functions.extend([search_web, fetch_url])
 
+        # `request_more_search` is the "deepen" tool -- runs the FULL fanout
+        # pipeline (Kagi + specialty routers + NL filter + loader) and returns
+        # loaded content inline, vs `search_web` which returns titles+links only.
+        # Only register when there's deepen budget; capacity is enforced inside
+        # the tool body too, but excluding the spec when the cap is 0 keeps the
+        # model from even seeing it as a callable.
+        if int(getattr(request.app.state.config, 'WEB_SEARCH_MAX_DEEPENS', 2) or 0) > 0:
+            builtin_functions.append(request_more_search)
+
     # Add image generation/edit tools if builtin category enabled AND enabled globally AND model has image_generation capability
     if (
         is_builtin_tool_enabled('image_generation')
@@ -642,6 +652,163 @@ async def get_builtin_tools(
         tools_dict[func.__name__] = {
             'tool_id': f'builtin:{func.__name__}',
             'callable': callable,
+            'spec': spec,
+            'type': 'builtin',
+        }
+
+    return tools_dict
+
+
+# ── Tool-use-capable model detection ──────────────────────────────────────
+#
+# Models that emit OpenAI-style `tool_calls` (or a provider-side parser
+# converts a structured action block into `tool_calls`) get our always-on
+# executor-backed tool set advertised even when the chat-level Web Search
+# toggle is OFF. Without this, vLLM's `cohere_command4` parser short-
+# circuits when `tools=[]` and leaks the `<|START_ACTION|>...` block into
+# `delta.content` -> empty chat. See get_always_on_executor_tools below.
+#
+# The regex is intentionally permissive on family prefixes -- it's the
+# default when no allowlist is configured. Operators can tighten via
+# config.TOOL_USE_CAPABLE_MODELS (substring allowlist; when non-empty,
+# exclusive) and config.TOOL_USE_CAPABLE_MODELS_DENYLIST (always wins).
+_TOOL_USE_CAPABLE_DEFAULT_REGEX = re.compile(
+    r'^(gpt-|claude-|gemini-|qwen|command|llama-3|llama-4|deepseek|mistral)',
+    re.IGNORECASE,
+)
+
+# Built-in deny: embedding-only models can't tool-call; gemma-3-1b is the
+# task model (title/follow-up/auto-memory) and shouldn't receive a tools
+# array. These survive even when the operator configures a permissive
+# allowlist -- they'd be a footgun otherwise.
+_TOOL_USE_BUILTIN_DENY_SUBSTRINGS: tuple[str, ...] = (
+    'gemma-3-1b',
+    'embedding',
+    'embeddinggemma',
+)
+
+
+def is_tool_use_capable_model(model_id: str, config: Any = None) -> bool:
+    """
+    Return True when ``model_id`` supports OpenAI-style native tool calling.
+
+    Resolution order:
+      1. Config TOOL_USE_CAPABLE_MODELS_DENYLIST substring match -> False.
+      2. Built-in deny substrings (embedding / task-only models) -> False.
+      3. Config TOOL_USE_CAPABLE_MODELS allowlist non-empty -> match-or-False
+         (allowlist is exclusive when set).
+      4. Default permissive regex on family prefix.
+
+    ``config`` is typically ``request.app.state.config``; ``None`` skips
+    the operator-configurable lists and falls straight to the regex.
+    """
+    if not model_id:
+        return False
+    name = str(model_id).strip()
+    if not name:
+        return False
+    name_lower = name.lower()
+
+    denylist: list[str] = []
+    allowlist: list[str] = []
+    if config is not None:
+        denylist = list(getattr(config, 'TOOL_USE_CAPABLE_MODELS_DENYLIST', None) or [])
+        allowlist = list(getattr(config, 'TOOL_USE_CAPABLE_MODELS', None) or [])
+
+    for needle in denylist:
+        if needle and needle.lower() in name_lower:
+            return False
+
+    for needle in _TOOL_USE_BUILTIN_DENY_SUBSTRINGS:
+        if needle in name_lower:
+            return False
+
+    if allowlist:
+        for needle in allowlist:
+            if needle and needle.lower() in name_lower:
+                return True
+        return False
+
+    return bool(_TOOL_USE_CAPABLE_DEFAULT_REGEX.match(name_lower))
+
+
+async def get_always_on_executor_tools(
+    request: Request, extra_params: dict, model: dict | None = None
+) -> dict[str, dict]:
+    """
+    Return the subset of executor-backed builtin tools that should be
+    advertised to tool-use-capable models regardless of the chat-level
+    feature toggles.
+
+    Mirrors :func:`get_builtin_tools`' output shape so the caller can merge
+    the result into its ``tools_dict`` directly. The native-FC branch in
+    middleware then derives ``form_data['tools']`` from this same dict --
+    one source of truth for both "advertise to model" and "dispatch when
+    the model calls it".
+
+    Tools included:
+      * ``search_web`` / ``fetch_url`` -- the always-on web set.
+      * ``request_more_search`` -- only when WEB_SEARCH_MAX_DEEPENS > 0,
+        matching the gate in :func:`get_builtin_tools`.
+
+    Intentionally NOT included:
+      * Knowledge-base tools -- already always-advertised by
+        :func:`get_builtin_tools` when the model has attached knowledge or
+        ``ENABLE_KB_EXEC`` is on (they aren't gated on a chat-level toggle).
+      * Image / code-interpreter / memory / etc. -- those depend on
+        explicit user opt-in via features, and force-advertising them
+        would be intrusive.
+
+    Per-chat ``features.get('web_search')`` and per-user permission gates
+    are intentionally bypassed -- this is the whole point of "always-on".
+    Global ``ENABLE_WEB_SEARCH`` and per-model capability metadata are
+    still respected.
+    """
+    tools_dict: dict[str, dict] = {}
+    builtin_functions: list[Callable] = []
+    model = model or {}
+
+    def get_model_capability(name: str, default: bool = True) -> bool:
+        return (model.get('info', {}).get('meta', {}).get('capabilities') or {}).get(
+            name, default
+        )
+
+    def is_builtin_tool_enabled(category: str) -> bool:
+        builtin_tools = model.get('info', {}).get('meta', {}).get('builtinTools', {})
+        return builtin_tools.get(category, True)
+
+    if (
+        is_builtin_tool_enabled('web_search')
+        and getattr(request.app.state.config, 'ENABLE_WEB_SEARCH', False)
+        and get_model_capability('web_search')
+    ):
+        builtin_functions.extend([search_web, fetch_url])
+        if int(getattr(request.app.state.config, 'WEB_SEARCH_MAX_DEEPENS', 2) or 0) > 0:
+            builtin_functions.append(request_more_search)
+
+    if not builtin_functions:
+        return tools_dict
+
+    for func in builtin_functions:
+        callable_fn = await get_async_tool_function_and_apply_extra_params(
+            func,
+            {
+                '__request__': request,
+                '__user__': extra_params.get('__user__', {}),
+                '__event_emitter__': extra_params.get('__event_emitter__'),
+                '__event_call__': extra_params.get('__event_call__'),
+                '__metadata__': extra_params.get('__metadata__'),
+                '__chat_id__': extra_params.get('__chat_id__'),
+                '__message_id__': extra_params.get('__message_id__'),
+            },
+        )
+        pydantic_model = convert_function_to_pydantic_model(func)
+        spec = convert_pydantic_model_to_openai_function_spec(pydantic_model)
+        spec = clean_openai_tool_schema(spec)
+
+        tools_dict[func.__name__] = {
+            'tool_id': f'builtin:{func.__name__}',
+            'callable': callable_fn,
             'spec': spec,
             'type': 'builtin',
         }
