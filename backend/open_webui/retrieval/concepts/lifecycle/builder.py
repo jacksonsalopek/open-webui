@@ -47,6 +47,11 @@ _SUFFIX_TO_LANGUAGE: dict[str, str] = {
     '.py': 'python',
     '.ts': 'typescript',
     '.tsx': 'typescript',
+    '.cpp': 'cpp',
+    '.cc': 'cpp',
+    '.cxx': 'cpp',
+    '.hpp': 'cpp',
+    '.h': 'cpp',
 }
 
 

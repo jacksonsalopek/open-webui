@@ -975,3 +975,95 @@ def test_ppr_damping_effect(store_impl: GraphStore) -> None:
         iterations=30,
     )
     assert high_damp[ids['hop2']] > low_damp[ids['hop2']]
+
+
+def _assert_embedding_matches(
+    store_impl: GraphStore,
+    concept_id: int,
+    expected: tuple[float, ...] | None,
+) -> None:
+    """Assert stored embedding matches ``expected`` (Kuzu may zero-pad)."""
+    stored = store_impl.get_concept(concept_id)
+    assert stored is not None
+    if expected is None:
+        assert stored.embedding is None
+        return
+    assert stored.embedding is not None
+    assert stored.embedding[: len(expected)] == expected
+    if len(stored.embedding) > len(expected):
+        assert all(v == 0.0 for v in stored.embedding[len(expected) :])
+
+
+def test_list_concepts_returns_all(store_impl: GraphStore) -> None:
+    names = ('alpha', 'beta', 'gamma', 'delta', 'epsilon')
+    expected_ids = {_upsert(store_impl, _concept(name)) for name in names}
+    listed = list(store_impl.list_concepts())
+    assert len(listed) == 5
+    assert {c.id for c in listed} == expected_ids
+
+
+def test_list_concepts_is_id_ascending(store_impl: GraphStore) -> None:
+    for name in ('zebra', 'alpha', 'mango', 'beta'):
+        _upsert(store_impl, _concept(name))
+    ids = [c.id for c in store_impl.list_concepts()]
+    assert ids == sorted(ids)
+    assert len(ids) >= 2
+    assert ids == sorted(set(ids))
+
+
+def test_list_concepts_is_deterministic(store_impl: GraphStore) -> None:
+    for name in ('one', 'two', 'three'):
+        _upsert(store_impl, _concept(name))
+    first = list(store_impl.list_concepts())
+    second = list(store_impl.list_concepts())
+    assert first == second
+
+
+def test_list_concepts_empty_store(store_impl: GraphStore) -> None:
+    assert list(store_impl.list_concepts()) == []
+
+
+def test_set_concept_embedding_overwrites_existing(store_impl: GraphStore) -> None:
+    cid = _upsert(store_impl, _concept('embed-me', embedding=(1.0, 0.0)))
+    store_impl.set_concept_embedding(cid, (0.0, 1.0))
+    _assert_embedding_matches(store_impl, cid, (0.0, 1.0))
+    store_impl.set_concept_embedding(cid, None)
+    assert store_impl.get_concept(cid) is not None
+    assert store_impl.get_concept(cid).embedding is None
+
+
+def test_set_concept_embedding_unknown_id_raises_keyerror(
+    store_impl: GraphStore,
+) -> None:
+    with pytest.raises(KeyError):
+        store_impl.set_concept_embedding(999_999, (1.0, 0.0))
+
+
+def test_set_concept_embedding_empty_tuple_raises_valueerror(
+    store_impl: GraphStore,
+) -> None:
+    cid = _upsert(store_impl, _concept('empty-tuple'))
+    with pytest.raises(ValueError, match='empty-tuple'):
+        store_impl.set_concept_embedding(cid, ())
+
+
+def test_set_concept_embedding_reflected_in_vector_search(
+    store_impl: GraphStore,
+) -> None:
+    a_id = _upsert(store_impl, _concept('concept-a', embedding=(1.0, 0.0)))
+    b_id = _upsert(store_impl, _concept('concept-b', embedding=(0.0, 1.0)))
+    query = (1.0, 0.0)
+
+    before = store_impl.vector_search(query, limit=1)
+    assert before[0][0].id == a_id
+    assert before[0][1] > 0.0
+
+    store_impl.set_concept_embedding(a_id, (0.0, 1.0))
+    after = store_impl.vector_search(query, limit=2)
+
+    if after[0][0].id == a_id:
+        assert len(after) >= 2
+        assert after[0][1] == after[1][1]
+        assert a_id < after[1][0].id
+    else:
+        assert after[0][0].id != a_id

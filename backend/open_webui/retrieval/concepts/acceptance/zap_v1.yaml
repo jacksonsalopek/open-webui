@@ -1,0 +1,274 @@
+version: 1
+codebase: zap
+generated_at: 2026-06-26
+description: |
+  Cross-corpus acceptance probe for the concept knowledge graph. 10 hand-curated
+  developer questions against the Zap WinUI 3 starter template
+  (~62 files: 58 .cs across Zap + Zap.Core, 4 .cpp/.h in Zap.ShellExt).
+
+  Purpose: validate that the Phase 1 algorithm + tuning that earns 9/9 on
+  Lollipop transfers to a different C# codebase plus a cross-language
+  (C++) shell-extension stress test. Same retrievers, same scoring
+  function, same per-intent thresholds as lollipop_v1.yaml.
+questions:
+  - id: q01_svg_processor
+    intent: find_symbol
+    difficulty: easy
+    question: "where is the SVG image processor implemented?"
+    expected_files:
+      - src/Zap.Core/Services/Processors/SvgProcessor.cs
+    # Authored blind from SvgProcessor.cs. The file is partial class
+    # SvgProcessor : IImageProcessor, with methods CompressAsync /
+    # OptimizeSvg / RemoveEmptyGroups / RemoveEditorMetadata, returning
+    # CompressionResult, manipulating XElement / XDocument from
+    # System.Xml.Linq. All five expected concepts appear as identifiers
+    # in the source.
+    expected_concepts:
+      - svg
+      - processor
+      - optimize
+      - compressionresult
+      - xelement
+    expected_answer_signal:
+      - SvgProcessor
+      - CompressAsync
+      - RemoveEmptyGroups
+      - RemoveEditorMetadata
+    notes: |
+      Easy symbol lookup. Class name maps cleanly to question vocabulary;
+      vector-only RAG should also handle this. Anchors the easy end.
+
+  - id: q02_vips_format_dispatch
+    intent: find_symbol
+    difficulty: medium
+    question: "where do we pick between PNG, JPEG, and WebP encoder options when compressing an image?"
+    expected_files:
+      - src/Zap.Core/Services/Processors/VipsImageProcessor.cs
+    expected_concepts:
+      - vips
+      - image
+      - format
+      - detect
+      - processor
+    expected_answer_signal:
+      - VipsImageProcessor
+      - DetectFormat
+      - ImageFormat
+      - libvips
+    notes: |
+      Medium: question vocabulary (PNG/JPEG/WebP) is value-domain;
+      answer keys off DetectFormat + ImageFormat enum dispatch inside
+      VipsImageProcessor. Tests whether vips identifier surfaces from
+      a question that never says "vips".
+
+  - id: q03_shell_explorer_command
+    intent: find_symbol
+    difficulty: hard
+    question: "where do we implement the right-click Explorer context menu entry for compressing images?"
+    expected_files:
+      - src/Zap.ShellExt/ZapCommand.cpp
+      - src/Zap.ShellExt/ZapCommand.h
+    expected_concepts:
+      - shell
+      - explorer
+      - command
+      - invoke
+      - zap
+    expected_answer_signal:
+      - IExplorerCommand
+      - ZapCommand
+      - Invoke
+      - GetTitle
+    notes: |
+      Hard cross-language probe. Answer lives in C++ files (Zap.ShellExt).
+      Tests whether the C# PascalCase-tuned tokenizer also produces useful
+      atomics from cpp source (IExplorerCommand → explorer + command;
+      ZapCommand → zap + command). Will fail if cpp coverage in the
+      builder is missing or if cpp tokenization is too sparse.
+
+  - id: q04_backup_caller
+    intent: where_used
+    difficulty: medium
+    question: "who calls the backup service before mutating an original image file?"
+    expected_files:
+      - src/Zap.Core/Services/CompressionService.cs
+      - src/Zap/ViewModels/MainViewModel.cs
+    expected_concepts:
+      - backup
+      - original
+      - file
+      - compression
+      - revert
+    expected_answer_signal:
+      - BackupAsync
+      - RevertAsync
+      - _backupService
+      - BackupFilePath
+    notes: |
+      Where-used spanning service layer and viewmodel. CompressionService
+      writes the backup; MainViewModel calls Revert. Graph REFERENCES
+      edges should connect backup/original concepts to both files.
+
+  - id: q05_theme_persist
+    intent: where_used
+    difficulty: medium
+    question: "where is the saved theme preference loaded when the app starts up?"
+    expected_files:
+      - src/Zap/Services/ThemeService.cs
+    # Authored blind from ThemeService.cs. The class uses
+    # ApplicationData.Current.LocalSettings for persistence, declares
+    # CurrentTheme : ElementTheme, and has private methods LoadThemeSetting
+    # / SaveThemeSetting reading/writing the AppTheme key. All five
+    # expected concepts appear as identifiers in the source — `application`
+    # is from the ApplicationData WinRT API, not a query echo.
+    expected_concepts:
+      - theme
+      - load
+      - settings
+      - application
+      - elementtheme
+    expected_answer_signal:
+      - ThemeService
+      - LoadThemeSetting
+      - SaveThemeSetting
+      - Initialize
+      - ApplicationData
+    notes: |
+      Where-used: the read path is LoadThemeSetting inside ThemeService;
+      Initialize is the entry. Tests whether the graph connects
+      theme/settings/load even when no single identifier matches the
+      question's "preference" vocabulary.
+
+  - id: q06_compression_dispatch
+    intent: explain_region
+    difficulty: medium
+    question: "how does the app pick which image processor handles a given file?"
+    expected_files:
+      - src/Zap.Core/Services/CompressionService.cs
+      - src/Zap.Core/Contracts/IImageProcessor.cs
+    expected_concepts:
+      - compression
+      - processor
+      - image
+      - supports
+      - format
+    expected_answer_signal:
+      - CompressionService
+      - IImageProcessor
+      - IEnumerable
+      - Supports
+    notes: |
+      Explain-region: CompressionService injects IEnumerable<IImageProcessor>
+      via DI (registered in App.xaml.cs: VipsImageProcessor + SvgProcessor)
+      and dispatches based on file format. Tests whether the explain_region
+      router assembles the DI + interface + dispatch narrative.
+
+  - id: q07_single_instance_pipe
+    intent: explain_region
+    difficulty: hard
+    question: "how does Zap make sure only one instance runs and how does a second launch hand its files off?"
+    expected_files:
+      - src/Zap/Program.cs
+      - src/Zap/App.xaml.cs
+    # Authored blind from Program.cs. The entry point declares
+    # MutexName / PipeName consts (literal "VentanaTools.Zap.SingleInstance"
+    # and "VentanaTools.Zap.Pipe"), uses System.Threading.Mutex for the
+    # single-instance gate, NamedPipeClientStream / NamedPipeServerStream
+    # for IPC, and method SendArgsToRunningInstance to forward `args`.
+    # `named-pipe` is the glossary phrase canonical for NamedPipe*Stream
+    # types; the remaining four are atomics that appear as identifiers.
+    expected_concepts:
+      - mutex
+      - named-pipe
+      - instance
+      - args
+      - single
+    expected_answer_signal:
+      - Mutex
+      - NamedPipeServerStream
+      - NamedPipeClientStream
+      - HandleActivationAsync
+      - MutexName
+    notes: |
+      Hard explain-region: Program.cs uses a named Mutex (acquire = first)
+      and a NamedPipe (subsequent launches send args). App.xaml.cs receives
+      and processes the activation. Tests assembly of a multi-file
+      mechanism from concept vocabulary the question gives ("instance",
+      "hand off") that isn't an exact symbol name.
+
+  - id: q08_mica_titlebar_dark
+    intent: find_concept
+    difficulty: easy
+    question: "where does the app set up the modern Windows blur effect and custom title bar for dark mode?"
+    expected_files:
+      - src/Zap/MainWindow.xaml.cs
+      - src/Zap/Helpers/TitleBarHelper.cs
+      - src/Zap/Services/ThemeService.cs
+    expected_concepts:
+      - mica
+      - title
+      - bar
+      - theme
+      - backdrop
+    expected_answer_signal:
+      - MicaBackdrop
+      - SystemBackdrop
+      - TitleBarHelper
+      - DWMWA_USE_IMMERSIVE_DARK_MODE
+    notes: |
+      Easy find_concept that probes terms-of-art coverage. "Mica" is a
+      Windows-specific term not in glossary/default.yaml; this is a
+      single-language atomic that should still surface via PascalCase
+      decomposition of MicaBackdrop. If q08 fails, it's a glossary gap.
+
+  - id: q09_command_palette
+    intent: find_concept
+    difficulty: medium
+    question: "what's the thing that lets you fuzzy-search and run actions from the keyboard?"
+    expected_files:
+      - src/Zap/Services/CommandPaletteService.cs
+      - src/Zap/ViewModels/CommandPaletteViewModel.cs
+    expected_concepts:
+      - command
+      - palette
+      - filter
+      - register
+      - item
+    expected_answer_signal:
+      - CommandPaletteService
+      - CommandPaletteViewModel
+      - RefreshFilter
+      - ExecuteSelected
+      - FilteredCommands
+    notes: |
+      Find_concept with no anchor symbol in the query — vocabulary is
+      "fuzzy-search" / "from the keyboard". The graph co-occurrence of
+      command + palette + filter should pull the right files; pure
+      vector RAG may surface unrelated command-handling code.
+
+  - id: q10_appinstaller_update
+    intent: find_concept
+    difficulty: medium
+    question: "how does the app know there's a new version available and trigger the in-place update?"
+    expected_files:
+      - src/Zap/Services/UpdateService.cs
+      - src/Zap/ViewModels/SettingsViewModel.cs
+    expected_concepts:
+      - update
+      - appinstaller
+      - check
+      - version
+      - service
+    expected_answer_signal:
+      - UpdateService
+      - CheckForUpdateAsync
+      - UpdateCheckResult
+      - AppInstaller
+      - SettingsViewModel
+    notes: |
+      Find_concept across service and viewmodel. UpdateService.CheckForUpdateAsync
+      reads update.json; SettingsViewModel downloads and launches the
+      .appinstaller file via shell-execute. "appinstaller" is a
+      Windows-specific term-of-art that the graph picks up as an
+      atomic (from class names like AppInstaller property and string
+      literals via comment-bearing chunks).

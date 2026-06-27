@@ -21,9 +21,10 @@ from __future__ import annotations
 import logging
 import math
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any
 
 import kuzu
@@ -771,6 +772,172 @@ class KuzuGraphStore:
         )
         return new_id
 
+    def _collect_incident_edges(self, concept_id: int) -> list[Edge]:
+        """Return every edge touching ``concept_id`` (both directions)."""
+        edges: list[Edge] = []
+        seen: set[tuple[EdgeType, int, int]] = set()
+
+        for edge_type, meta in _EDGE_REL.items():
+            table = meta['table']
+            from_label = meta['from_label']
+            to_label = meta['to_label']
+
+            if from_label == 'Concept':
+                result = self._conn.execute(
+                    f"""
+                    MATCH (a:Concept {{id: $cid}})-[r:{table}]->(b:{to_label})
+                    RETURN b.id
+                    """,
+                    {'cid': concept_id},
+                )
+                for row in result:
+                    dst_id = int(_row_value(row, 0))
+                    key = (edge_type, concept_id, dst_id)
+                    if key in seen:
+                        continue
+                    props = self._fetch_edge_properties(edge_type, concept_id, dst_id)
+                    if props is None:
+                        continue
+                    seen.add(key)
+                    edges.append(
+                        Edge(
+                            type=edge_type,
+                            src_id=concept_id,
+                            dst_id=dst_id,
+                            properties=MappingProxyType(dict(props)),
+                        ),
+                    )
+
+            if to_label == 'Concept' and from_label != 'Concept':
+                result = self._conn.execute(
+                    f"""
+                    MATCH (a:{from_label})-[r:{table}]->(b:Concept {{id: $cid}})
+                    RETURN a.id
+                    """,
+                    {'cid': concept_id},
+                )
+                for row in result:
+                    src_id = int(_row_value(row, 0))
+                    key = (edge_type, src_id, concept_id)
+                    if key in seen:
+                        continue
+                    props = self._fetch_edge_properties(edge_type, src_id, concept_id)
+                    if props is None:
+                        continue
+                    seen.add(key)
+                    edges.append(
+                        Edge(
+                            type=edge_type,
+                            src_id=src_id,
+                            dst_id=concept_id,
+                            properties=MappingProxyType(dict(props)),
+                        ),
+                    )
+            elif to_label == 'Concept' and from_label == 'Concept':
+                result = self._conn.execute(
+                    f"""
+                    MATCH (a:Concept)-[r:{table}]->(b:Concept {{id: $cid}})
+                    RETURN a.id
+                    """,
+                    {'cid': concept_id},
+                )
+                for row in result:
+                    src_id = int(_row_value(row, 0))
+                    key = (edge_type, src_id, concept_id)
+                    if key in seen:
+                        continue
+                    props = self._fetch_edge_properties(edge_type, src_id, concept_id)
+                    if props is None:
+                        continue
+                    seen.add(key)
+                    edges.append(
+                        Edge(
+                            type=edge_type,
+                            src_id=src_id,
+                            dst_id=concept_id,
+                            properties=MappingProxyType(dict(props)),
+                        ),
+                    )
+
+        return edges
+
+    def _reinsert_concept_with_embedding(
+        self,
+        concept: Concept,
+        embedding_payload: list[float] | None,
+    ) -> None:
+        """Replace a concept row when Kuzu blocks SET on vector-indexed embeddings."""
+        concept_id = concept.id
+        incident = self._collect_incident_edges(concept_id)
+        self._conn.execute(
+            'MATCH (c:Concept {id: $id}) DETACH DELETE c',
+            {'id': concept_id},
+        )
+        self._conn.execute(
+            """
+            CREATE (c:Concept {
+                id: $id,
+                name: $name,
+                kind: $kind,
+                first_seen_at: $first_seen_at,
+                last_seen_at: $last_seen_at,
+                centrality_score: $centrality_score,
+                embedding: $embedding,
+                definition: $definition,
+                language_hint: $language_hint,
+                original_tokens: $original_tokens
+            })
+            """,
+            {
+                'id': concept_id,
+                'name': concept.name,
+                'kind': concept.kind.value,
+                'first_seen_at': concept.first_seen_at,
+                'last_seen_at': concept.last_seen_at,
+                'centrality_score': concept.centrality_score,
+                'embedding': embedding_payload,
+                'definition': concept.definition,
+                'language_hint': concept.language_hint,
+                'original_tokens': list(concept.original_tokens),
+            },
+        )
+        for edge in incident:
+            self._create_edge(
+                edge.type,
+                edge.src_id,
+                edge.dst_id,
+                edge.properties,
+            )
+
+    def set_concept_embedding(
+        self,
+        concept_id: int,
+        embedding: tuple[float, ...] | None,
+    ) -> None:
+        if embedding == ():
+            raise ValueError(
+                f'set_concept_embedding({concept_id}): empty-tuple embedding is '
+                f'rejected; pass None to clear instead.',
+            )
+        existing = self.get_concept(concept_id)
+        if existing is None:
+            raise KeyError(concept_id)
+
+        embedding_payload = self._pad_embedding(embedding)
+        try:
+            self._conn.execute(
+                'MATCH (c:Concept {id: $id}) SET c.embedding = $embedding',
+                {'id': concept_id, 'embedding': embedding_payload},
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            if (
+                'used in one or more indexes' not in msg
+                and 'does not exist in catalog' not in msg
+            ):
+                raise
+            self._reinsert_concept_with_embedding(existing, embedding_payload)
+
     def upsert_concepts_batch(self, concepts: Sequence[Concept]) -> list[int]:
         if not concepts:
             return []
@@ -1352,6 +1519,19 @@ class KuzuGraphStore:
         for row in result:
             return concept_from_dict(self._concept_row_to_dict(row))
         return None
+
+    def list_concepts(self) -> Iterable[Concept]:
+        result = self._conn.execute(
+            'MATCH (c:Concept) RETURN c.id ORDER BY c.id ASC',
+        )
+        ids: list[int] = []
+        while result.has_next():
+            row = result.get_next()
+            ids.append(int(row[0]))
+        for cid in ids:
+            concept = self.get_concept(cid)
+            if concept is not None:
+                yield concept
 
     def find_concept_by_name(
         self,

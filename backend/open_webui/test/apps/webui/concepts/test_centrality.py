@@ -4,14 +4,10 @@ from __future__ import annotations
 
 import time
 from datetime import datetime, timezone
-from pathlib import Path
 
 import pytest
 
-from open_webui.retrieval.concepts.extraction.extractor import extract
-from open_webui.retrieval.concepts.extraction.glossary import Glossary
 from open_webui.retrieval.concepts.extraction.stopwords import is_stopword
-from open_webui.retrieval.concepts.lifecycle.builder import BuildPlan, BuilderPruneOptions, build
 from open_webui.retrieval.concepts.lifecycle.centrality import (
     CentralityScores,
     clear_cache,
@@ -26,37 +22,11 @@ from open_webui.retrieval.concepts.schema import (
     ConceptKind,
     CoOccursWithProps,
     DefinesProps,
-    Edge,
-    EdgeType,
     edge_with_props,
 )
 from open_webui.retrieval.concepts.store.memory_store import InMemoryGraphStore
-from langchain_core.documents import Document
 
 _TS = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
-
-_TOOLBAR_FIXTURE = '''
-public sealed partial class ToolbarViewModel : ObservableObject
-{
-    private readonly SelectionService _selection;
-    private readonly IReadOnlyList<IToolbarExtension> _allExtensions;
-    private readonly ExtensionSettingsService _extensionSettings;
-    private readonly DispatcherQueue _dispatcher;
-    private CancellationTokenSource? _runCts;
-
-    public void ExecuteExtension() { }
-    private void CancelActiveRun() { }
-}
-'''
-
-_CODE_STOPWORDS = frozenset(
-    {'if', 'null', 'return', 'string', 'for', 'var', 'void', 'true', 'false'},
-)
-
-
-@pytest.fixture
-def default_glossary() -> Glossary:
-    return Glossary.default()
 
 
 def _upsert_concept(store: InMemoryGraphStore, name: str) -> int:
@@ -212,100 +182,47 @@ def test_clear_cache_evicts() -> None:
 
 
 def test_lollipop_semantic_centrality_top5_quality(
-    tmp_path: Path,
-    default_glossary: Glossary,
+    lollipop_subset_store: InMemoryGraphStore,
 ) -> None:
-    glossary = default_glossary
-    store = InMemoryGraphStore()
+    """The top-5 concepts by semantic centrality should include at least one
+    Lollipop domain term, validating that centrality surfaces signal over noise.
 
-    lollipop_subset = Path('/tmp/lollipop_subset')
-    toolbar_path = Path('/tmp/ToolbarViewModel.cs')
+    Domain terms match concept names containing view/service/helper/extension/
+    command/model substrings, or canonical glossary names from the Lollipop
+    ViewModels/Services/Extensions corpus.
 
-    if toolbar_path.is_file():
-        plan = BuildPlan(
-            roots=(toolbar_path.parent,),
-            language_hint='csharp',
-            include_globs=(toolbar_path.name,),
-            builder_prune=BuilderPruneOptions(min_cooccurrence_weight=2),
-        )
-        build(plan, store)
-        expect_domain = True
-    elif lollipop_subset.is_dir() and any(lollipop_subset.glob('*.cs')):
-        plan = BuildPlan(
-            roots=(lollipop_subset,),
-            language_hint='csharp',
-            builder_prune=BuilderPruneOptions(min_cooccurrence_weight=2),
-        )
-        build(plan, store)
-        expect_domain = False
-    else:
-        doc = Document(
-            page_content=_TOOLBAR_FIXTURE,
-            metadata={
-                'source': str(tmp_path / 'ToolbarViewModel.cs'),
-                'code_split_language': 'csharp',
-                'ast_symbol': 'ToolbarViewModel',
-            },
-        )
-        result = extract(doc, glossary=glossary, now=_TS)
-        artifact_id = store.upsert_artifact(result.artifact)
-        concept_ids = store.upsert_concepts_batch(list(result.concepts))
-        key_to_id = {
-            (c.name, c.kind): concept_ids[i] for i, c in enumerate(result.concepts)
-        }
-
-        def remap(node_id: int) -> int:
-            if node_id == 0:
-                return artifact_id
-            concept = next(c for c in result.concepts if c.id == node_id)
-            return key_to_id[(concept.name, concept.kind)]
-
-        edges = [
-            Edge(
-                type=edge.type,
-                src_id=remap(edge.src_id),
-                dst_id=remap(edge.dst_id),
-                properties=edge.properties,
-            )
-            for edge in result.edges
-        ]
-        store.upsert_edges_batch(edges)
-        compute_and_persist(store)
-        expect_domain = True
+    Replaces the legacy 3-file-fallback version of this test.
+    """
+    store = lollipop_subset_store
+    compute_and_persist(store)  # idempotent; builder already computed centrality
 
     scores = get_cached(store)
     assert scores is not None
 
-    top_sem = sorted(scores.semantic.items(), key=lambda kv: -kv[1])[:5]
-    top_str = sorted(scores.structural.items(), key=lambda kv: -kv[1])[:5]
+    top5 = sorted(scores.semantic.items(), key=lambda kv: -kv[1])[:5]
+    top5_names = [store.get_concept(cid).name for cid, _ in top5]  # type: ignore[union-attr]
 
-    sem_names = {store.get_concept(cid).name for cid, _ in top_sem}  # type: ignore[union-attr]
-
-    # Extractor-pruned + stopword-classified tokens must not dominate semantic rank.
     classified_stopword_hits = {
-        name for name in sem_names if is_stopword(name, language='csharp')
+        name for name in top5_names if is_stopword(name, language='csharp')
     }
     assert not classified_stopword_hits, (
         f'semantic top-5 contains classified stopwords: {classified_stopword_hits}'
     )
 
-    # Hard-coded C# keyword list from the Phase 1 quality gate. Tokens absent from
-    # the stopword tables (e.g. ``if``, ``null``) may still leak until risk #4 lands.
-    aspirational_leaks = sem_names & _CODE_STOPWORDS
-    if aspirational_leaks:
-        pytest.xfail(
-            f'carry-forward risk #4: semantic top-5 still contains unclassified '
-            f'C# keywords {aspirational_leaks}',
-        )
-
-    domain_hits = sem_names & {
-        'toolbar',
+    domain_substrings = (
+        'view',
+        'service',
+        'helper',
         'extension',
-        'viewmodel',
-        'selection',
-        'observable',
-        'execute',
+        'command',
         'model',
-    }
-    if expect_domain:
-        assert domain_hits, f'expected domain concepts in semantic top-5, got {sem_names}'
+        'toolbar',
+        'selection',
+    )
+    matches = [
+        n for n in top5_names if any(s in n.lower() for s in domain_substrings)
+    ]
+    assert len(matches) >= 1, (
+        f'expected at least 1 domain-flavored concept in top-5 semantic '
+        f'centrality; got {top5_names}'
+    )

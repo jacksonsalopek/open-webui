@@ -8,7 +8,7 @@ implementations only (see ``CONCEPT_GRAPH.md`` §"Compatibility shim").
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from typing import Protocol, runtime_checkable
 
 from open_webui.retrieval.concepts.schema import (
@@ -97,6 +97,32 @@ class GraphStore(Protocol):
         """
         ...
 
+    def set_concept_embedding(
+        self,
+        concept_id: int,
+        embedding: tuple[float, ...] | None,
+    ) -> None:
+        """Set (or clear) the embedding of an existing concept.
+
+        Unlike ``upsert_concept`` — whose merge semantics preserve an existing
+        non-None embedding over an incoming one to protect callers from
+        accidentally clobbering precomputed vectors — this method is an
+        explicit, idempotent embedding-only update.
+
+        Raises ``KeyError`` if ``concept_id`` is not present in the store.
+
+        ``embedding=None`` clears the embedding (sets it back to None); callers
+        who want this semantic must pass None explicitly. Passing an empty tuple
+        is rejected with ``ValueError`` to make the "I forgot to compute it" bug
+        loud rather than silent.
+
+        **Determinism contract:** after a successful call,
+        ``get_concept(concept_id).embedding`` is exactly the tuple passed in
+        (None preserves None). Subsequent calls to ``vector_search`` reflect
+        the new embedding immediately.
+        """
+        ...
+
     def upsert_edge(self, edge: Edge) -> None:
         """Insert or merge an edge keyed by ``(type, src_id, dst_id)``.
 
@@ -142,6 +168,30 @@ class GraphStore(Protocol):
         Idiomatic use: the router's seed-resolution step calls this to convert
         free-text query tokens into concept ids before delegating to a graph-
         walking retriever."""
+        ...
+
+    def list_concepts(self) -> Iterable[Concept]:
+        """Enumerate every concept in the store, deterministically.
+
+        **Determinism contract:** yields concepts in ascending order by
+        ``concept.id``. Repeated calls on an unchanged store yield identical
+        sequences.
+
+        The iterable is intended to be consumed once; callers wanting a list
+        should wrap with ``list(...)``. Implementations MAY return a generator
+        that holds a snapshot of the id set at call time so concurrent
+        mutations do not affect a single iteration, but this is not part of the
+        contract; callers must not assume isolation from concurrent writes.
+
+        Use cases:
+
+        * Test-time backfill of derived fields (e.g. embeddings).
+        * Diagnostics / size reporting.
+        * Full-graph exports.
+
+        NOT intended as a substitute for ``vector_search`` or any retrieval
+        call; callers should prefer query-shaped primitives where they exist.
+        """
         ...
 
     def upsert_artifact(self, artifact: Artifact) -> int:

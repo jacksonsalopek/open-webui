@@ -1445,6 +1445,19 @@ def save_docs_to_vector_db(
         )
 
         log.info(f'added {len(items)} items to collection {collection_name}')
+        try:
+            from open_webui.retrieval.concepts.integration.ingest_hook import (
+                on_docs_saved,
+            )
+
+            on_docs_saved(
+                request.app.state,
+                collection_name=collection_name,
+                docs=docs,
+                metadata=metadata,
+            )
+        except Exception:
+            log.exception('concept_graph ingest hook failed; vector write unaffected')
         return True
     except Exception as e:
         log.exception(e)
@@ -2691,6 +2704,12 @@ async def query_doc_handler(
                     if form_data.hybrid_bm25_weight
                     else request.app.state.config.HYBRID_BM25_WEIGHT
                 ),
+                concept_graph_store=getattr(request.app.state, 'concept_graph_store', None),
+                concept_graph_embed_fn=None,  # async->sync embedder bridge not yet wired (W3.5 scaffold)
+                concept_graph_reranker=None,
+                concept_graph_tiebreaker=None,
+                concept_graph_embed_alpha=None,
+                concept_graph_catrag_alpha=None,
                 user=user,
             )
         else:
@@ -2759,6 +2778,12 @@ async def query_collection_handler(
                     if form_data.enable_enriched_texts is not None
                     else request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS
                 ),
+                concept_graph_store=getattr(request.app.state, 'concept_graph_store', None),
+                concept_graph_embed_fn=None,  # async->sync embedder bridge not yet wired (W3.5 scaffold)
+                concept_graph_reranker=None,
+                concept_graph_tiebreaker=None,
+                concept_graph_embed_alpha=None,
+                concept_graph_catrag_alpha=None,
             )
         else:
             return await query_collection(

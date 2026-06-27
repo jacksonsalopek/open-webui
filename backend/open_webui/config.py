@@ -1616,6 +1616,71 @@ YOUTUBE_LOADER_PROXY_URL = ConfigVar(
 
 
 ####################################
+# Concept Graph (Phase 2 wiring)
+####################################
+
+CONCEPT_GRAPH_ENABLED = ConfigVar(
+    'CONCEPT_GRAPH_ENABLED',
+    'rag.concept_graph.enabled',
+    os.getenv('CONCEPT_GRAPH_ENABLED', 'False').lower() == 'true',
+)
+
+CONCEPT_GRAPH_STORE_BACKEND = ConfigVar(
+    'CONCEPT_GRAPH_STORE_BACKEND',
+    'rag.concept_graph.store_backend',
+    os.getenv('CONCEPT_GRAPH_STORE_BACKEND', 'kuzu'),
+)  # memory | kuzu
+
+CONCEPT_GRAPH_KUZU_PATH = ConfigVar(
+    'CONCEPT_GRAPH_KUZU_PATH',
+    'rag.concept_graph.kuzu_path',
+    os.getenv('CONCEPT_GRAPH_KUZU_PATH', '/data/concept-graph.kuzu'),
+)
+
+CONCEPT_GRAPH_GLOSSARY_PATHS = ConfigVar(
+    'CONCEPT_GRAPH_GLOSSARY_PATHS',
+    'rag.concept_graph.glossary_paths',
+    os.getenv('CONCEPT_GRAPH_GLOSSARY_PATHS', ''),
+)  # ":"-separated paths
+
+CONCEPT_GRAPH_EMBEDDING_DIM = ConfigVar(
+    'CONCEPT_GRAPH_EMBEDDING_DIM',
+    'rag.concept_graph.embedding_dim',
+    int(os.getenv('CONCEPT_GRAPH_EMBEDDING_DIM', '2560')),
+)  # qwen3-embedding-mlx default
+
+CONCEPT_GRAPH_PAGERANK_DAMPING = ConfigVar(
+    'CONCEPT_GRAPH_PAGERANK_DAMPING',
+    'rag.concept_graph.pagerank_damping',
+    float(os.getenv('CONCEPT_GRAPH_PAGERANK_DAMPING', '0.85')),
+)
+
+CONCEPT_GRAPH_PAGERANK_ITERATIONS = ConfigVar(
+    'CONCEPT_GRAPH_PAGERANK_ITERATIONS',
+    'rag.concept_graph.pagerank_iterations',
+    int(os.getenv('CONCEPT_GRAPH_PAGERANK_ITERATIONS', '20')),
+)
+
+CONCEPT_GRAPH_REBUILD_INTERVAL_SECONDS = ConfigVar(
+    'CONCEPT_GRAPH_REBUILD_INTERVAL_SECONDS',
+    'rag.concept_graph.rebuild_interval_seconds',
+    int(os.getenv('CONCEPT_GRAPH_REBUILD_INTERVAL_SECONDS', '86400')),
+)  # 24h, matches PHASE1.md accepted trade-off #1
+
+CONCEPT_GRAPH_HYBRID_WEIGHT = ConfigVar(
+    'CONCEPT_GRAPH_HYBRID_WEIGHT',
+    'rag.concept_graph.hybrid_weight',
+    float(os.getenv('CONCEPT_GRAPH_HYBRID_WEIGHT', '0.3')),
+)
+
+CONCEPT_GRAPH_ROOTS = ConfigVar(
+    'CONCEPT_GRAPH_ROOTS',
+    'rag.concept_graph.roots',
+    os.getenv('CONCEPT_GRAPH_ROOTS', ''),
+)  # ":"-separated paths
+
+
+####################################
 # Web Search (RAG)
 ####################################
 

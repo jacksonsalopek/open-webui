@@ -725,6 +725,38 @@ async def lifespan(app: FastAPI):
 
     asyncio.create_task(scheduler_worker_loop(app))
 
+    # Concept knowledge graph (Phase 2): optionally construct the
+    # GraphStore and spawn the periodic rebuild loop.
+    try:
+        from open_webui.config import CONCEPT_GRAPH_ENABLED
+
+        if CONCEPT_GRAPH_ENABLED.value:
+            from open_webui.retrieval.concepts.integration.lifecycle_task import (
+                spawn_concept_graph_rebuild_loop,
+            )
+            from open_webui.retrieval.concepts.integration.store_factory import (
+                create_graph_store_from_config,
+            )
+
+            app.state.concept_graph_store = create_graph_store_from_config()
+            app.state.concept_graph_dirty = False
+            app.state.concept_graph_rebuild_task = spawn_concept_graph_rebuild_loop(
+                app=app
+            )
+            log.info(
+                'concept_graph: store + rebuild loop initialized at startup'
+            )
+        else:
+            app.state.concept_graph_store = None
+            app.state.concept_graph_dirty = False
+    except Exception:
+        log.exception(
+            'concept_graph: startup initialization failed; '
+            'feature disabled for this process'
+        )
+        app.state.concept_graph_store = None
+        app.state.concept_graph_dirty = False
+
     if app.state.config.ENABLE_BASE_MODELS_CACHE:
         try:
             await get_all_models(
@@ -792,6 +824,9 @@ async def lifespan(app: FastAPI):
 
     if hasattr(app.state, 'redis_task_command_listener'):
         app.state.redis_task_command_listener.cancel()
+
+    if hasattr(app.state, 'concept_graph_rebuild_task'):
+        app.state.concept_graph_rebuild_task.cancel()
 
 
 app = FastAPI(

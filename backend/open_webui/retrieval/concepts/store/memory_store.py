@@ -5,7 +5,7 @@ from __future__ import annotations
 import copy
 import math
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import replace
 from datetime import datetime
 from types import MappingProxyType
@@ -252,6 +252,21 @@ class InMemoryGraphStore:
         self._by_name_kind[key] = new_id
         return new_id
 
+    def set_concept_embedding(
+        self,
+        concept_id: int,
+        embedding: tuple[float, ...] | None,
+    ) -> None:
+        if embedding == ():
+            raise ValueError(
+                f'set_concept_embedding({concept_id}): empty-tuple embedding is '
+                f'rejected; pass None to clear instead.',
+            )
+        existing = self._concepts.get(concept_id)
+        if existing is None:
+            raise KeyError(concept_id)
+        self._concepts[concept_id] = replace(existing, embedding=embedding)
+
     def upsert_concepts_batch(self, concepts: Sequence[Concept]) -> list[int]:
         if not concepts:
             return []
@@ -305,6 +320,10 @@ class InMemoryGraphStore:
 
     def get_concept(self, concept_id: int) -> Concept | None:
         return self._concepts.get(concept_id)
+
+    def list_concepts(self) -> Iterable[Concept]:
+        for cid in sorted(self._concepts):
+            yield self._concepts[cid]
 
     def find_concept_by_name(
         self,

@@ -106,6 +106,28 @@ class NeighborhoodRetrieverConfig:
       weakly connected. This replaces the wave-7 three-knob ``cent_mult_idf``
       product with one principled signal. See ``CONCEPT_GRAPH_PHASE1.md`` §
       "Phase 1.5 — P0 accuracy closure" P0-3 for the rationale.
+    - ``'ppr_blend_embed'`` (Phase 2 experiment, June 2026): blend
+      min-max-normalized PPR with min-max-normalized cosine similarity
+      between ``query.embedding`` and each candidate's
+      ``concept.embedding``. Weights controlled by ``embed_blend_alpha``
+      (alpha on PPR, 1 - alpha on cosine). Falls back to pure PPR when
+      ``query.embedding`` is None or when a candidate has no embedding.
+      Designed to bridge query↔source vocabulary mismatches that PPR alone
+      can't see (e.g. query says "WebP encoder", source says
+      ``ImageFormat.Webp`` — same concept, different lexical surface).
+      Requires the caller to have populated ``concept.embedding`` on the
+      store (via the acceptance harness's ``embed_store_concepts`` or
+      equivalent production wiring).
+    - ``'catrag'`` (Phase 2 W5, CatRAG ACL 2026 Findings): extends
+      ``'ppr_blend_embed'`` with a glossary-anchor bonus — concepts whose
+      name appears as a case-insensitive substring in any phrase from
+      ``catrag_glossary_phrases`` receive an additive bump controlled by
+      ``catrag_anchor_alpha``. CatRAG proposes three query-time mechanisms:
+      symbolic anchoring (landed here), query-aware dynamic edge weighting
+      (landed via the cosine-over-embeddings blend shared with
+      ``'ppr_blend_embed'``), and key-fact passage enhancement (deferred to
+      W5.5 — requires a new ``GraphStore`` method to list IS_NAMED_IN
+      artifacts per concept).
     - ``'cent_mult_idf'`` (legacy default, kept for ablation): tiebreak by
       ``semantic_centrality × query_multiplicity × IDF``. The three factors
       pull in complementary directions:
@@ -132,6 +154,34 @@ class NeighborhoodRetrieverConfig:
     - ``'centrality'``: legacy semantic-centrality only (pre-Phase-2). Kept
       for regression comparisons.
     - ``'none'``: no tiebreaker — concept id ordering only."""
+
+    embed_blend_alpha: float = 0.5
+    """Weight on PPR for the ``'ppr_blend_embed'`` tiebreaker. Cosine
+    similarity gets ``(1 - embed_blend_alpha)``. Default 0.5 weights
+    them equally. Ignored for other tiebreaker modes. Must be in [0, 1]."""
+
+    catrag_anchor_alpha: float | None = None
+    """Weight on the glossary-anchor bonus for the ``'catrag'`` tiebreaker.
+
+    When the tiebreaker is ``'catrag'`` and ``catrag_anchor_alpha`` is set, hits
+    whose concept name appears (case-insensitive substring match) in any of the
+    glossary phrases extracted from ``query.text`` receive an additive bonus of
+    ``catrag_anchor_alpha`` to their normalized tiebreak score. ``None`` is treated
+    as ``0.0`` (no anchor bonus). Sensible range: [0.0, 1.0]; default at the
+    RouterConfig layer is 0.2.
+
+    Ignored for tiebreakers other than ``'catrag'``.
+    """
+
+    catrag_glossary_phrases: tuple[str, ...] = ()
+    """Glossary phrases extracted from the query at classification time. The
+    router threads ``ClassifiedIntent.extracted_phrases`` through to this field
+    when ``tiebreaker='catrag'``; left empty otherwise. The retriever uses these
+    to compute the symbolic-anchor bonus described in ``catrag_anchor_alpha``.
+
+    Empty tuple means no anchor bonus is applied (the catrag tiebreaker degenerates
+    gracefully to the `ppr_blend_embed` formula).
+    """
 
 
 class NeighborhoodRetriever:
@@ -274,15 +324,36 @@ class NeighborhoodRetriever:
             'cent_mult_idf',
             'centrality',
         )
+        wants_catrag = self.config.tiebreaker == 'catrag'
+        wants_ppr = self.config.tiebreaker in ('ppr', 'ppr_blend_embed', 'catrag')
+        wants_embed = self.config.tiebreaker in ('ppr_blend_embed', 'catrag')
         idf_map = _load_idf_scores(store) if wants_idf else None
         centrality_map = (
             _load_semantic_centrality(store) if wants_centrality else None
         ) or {}
         ppr_map: Mapping[int, float] = (
-            _load_ppr_scores(seeds, store, edge_types)
-            if self.config.tiebreaker == 'ppr'
-            else {}
+            _load_ppr_scores(seeds, store, edge_types) if wants_ppr else {}
         )
+
+        embed_scores: dict[int, float] = {}
+        norm_ppr: dict[int, float] = {}
+        norm_embed: dict[int, float] = {}
+        if wants_embed:
+            embed_scores = _compute_query_embed_similarities(
+                query.embedding,
+                concept_by_id,
+            )
+            # Normalize PPR and embed scores into a comparable [0, 1] band
+            # before blending. Without min-max normalization, the linear blend
+            # is dominated by whichever signal happens to have larger raw
+            # values for the candidate set (PPR scores can be 1e-4..1e-2 on
+            # a dense corpus; cosine is in [-1, 1]).
+            norm_ppr = _min_max_normalize_scores(
+                {cid: ppr_map.get(cid, 0.0) for cid in best_score},
+            )
+            norm_embed = _min_max_normalize_scores(
+                {cid: embed_scores.get(cid, 0.0) for cid in best_score},
+            )
 
         # Always thread ``query_multiplicity`` through provenance — even when
         # the tiebreaker doesn't use it, downstream auditors (and the
@@ -296,6 +367,29 @@ class NeighborhoodRetriever:
                 provenance['centrality'] = centrality_map.get(cid, 0.0)
             if ppr_map:
                 provenance['ppr'] = ppr_map.get(cid, 0.0)
+            if wants_embed:
+                provenance['embed_cosine'] = embed_scores.get(cid, 0.0)
+                provenance['embed_blend_alpha'] = self.config.embed_blend_alpha
+            if wants_catrag:
+                concept = concept_by_id.get(cid)
+                concept_name = concept.name if concept is not None else ''
+                is_anchor = _is_catrag_anchor(
+                    concept_name,
+                    self.config.catrag_glossary_phrases,
+                )
+                provenance['catrag_anchor_alpha'] = self.config.catrag_anchor_alpha
+                provenance['catrag_is_anchor'] = is_anchor
+                provenance['catrag_score'] = _compute_catrag_score(
+                    cid,
+                    embed_blend_alpha=self.config.embed_blend_alpha,
+                    catrag_anchor_alpha=self.config.catrag_anchor_alpha or 0.0,
+                    norm_ppr=norm_ppr,
+                    norm_embed=norm_embed,
+                    is_anchor=is_anchor,
+                )
+
+        alpha = self.config.embed_blend_alpha
+        anchor_alpha = self.config.catrag_anchor_alpha or 0.0
 
         def _sort_key(hit: RetrievalHit) -> tuple[float, float, float, int]:
             cid = hit.concept.id if hit.concept else 0
@@ -306,6 +400,33 @@ class NeighborhoodRetriever:
             if self.config.tiebreaker == 'ppr':
                 primary_tiebreak = -ppr_map.get(cid, 0.0)
                 secondary_tiebreak = 0.0
+            elif self.config.tiebreaker == 'ppr_blend_embed':
+                blend = (
+                    alpha * norm_ppr.get(cid, 0.0)
+                    + (1.0 - alpha) * norm_embed.get(cid, 0.0)
+                )
+                primary_tiebreak = -blend
+                # Secondary falls back to pure PPR so further ties (e.g.
+                # candidates without embeddings) still get a principled
+                # ordering instead of degenerating to concept-id order.
+                secondary_tiebreak = -ppr_map.get(cid, 0.0)
+            elif self.config.tiebreaker == 'catrag':
+                concept = concept_by_id.get(cid)
+                concept_name = concept.name if concept is not None else ''
+                is_anchor = _is_catrag_anchor(
+                    concept_name,
+                    self.config.catrag_glossary_phrases,
+                )
+                catrag_score = _compute_catrag_score(
+                    cid,
+                    embed_blend_alpha=alpha,
+                    catrag_anchor_alpha=anchor_alpha,
+                    norm_ppr=norm_ppr,
+                    norm_embed=norm_embed,
+                    is_anchor=is_anchor,
+                )
+                primary_tiebreak = -catrag_score
+                secondary_tiebreak = -ppr_map.get(cid, 0.0)
             elif self.config.tiebreaker == 'cent_mult_idf':
                 primary_tiebreak = -cent * mult * max(idf, 1e-6)
                 secondary_tiebreak = -idf * mult
@@ -492,6 +613,84 @@ def _load_ppr_scores(
             exc,
         )
         return {}
+
+
+def _compute_query_embed_similarities(
+    query_embedding: tuple[float, ...] | None,
+    concept_by_id: Mapping[int, Concept],
+) -> dict[int, float]:
+    """Return ``{concept_id: cosine(query_emb, concept_emb)}`` for every
+    candidate whose concept carries an embedding of the same dimensionality
+    as the query embedding.
+
+    Both embeddings are expected to be L2-normalized (the production
+    embedder + the acceptance harness's ``fake_embedder`` / ``real_embedder``
+    both normalize); we therefore compute cosine as a plain dot product
+    instead of recomputing norms on every call.
+
+    Candidates with no embedding, a mismatched embedding dimension, or
+    when ``query_embedding`` itself is None map to 0.0 — they fall back
+    to the secondary tiebreak (pure PPR) without inflating or deflating
+    the blend.
+    """
+    if not query_embedding:
+        return {cid: 0.0 for cid in concept_by_id}
+
+    q_dim = len(query_embedding)
+    out: dict[int, float] = {}
+    for cid, concept in concept_by_id.items():
+        emb = concept.embedding
+        if emb is None or len(emb) != q_dim:
+            out[cid] = 0.0
+            continue
+        out[cid] = sum(a * b for a, b in zip(query_embedding, emb))
+    return out
+
+
+def _is_catrag_anchor(concept_name: str, phrases: tuple[str, ...]) -> bool:
+    """Return True when ``concept_name`` is a non-empty substring of any phrase."""
+    if not concept_name:
+        return False
+    name_lower = concept_name.lower()
+    return any(name_lower in phrase.lower() for phrase in phrases)
+
+
+def _compute_catrag_score(
+    concept_id: int,
+    *,
+    embed_blend_alpha: float,
+    catrag_anchor_alpha: float,
+    norm_ppr: Mapping[int, float],
+    norm_embed: Mapping[int, float],
+    is_anchor: bool,
+) -> float:
+    """Additive CatRAG blend: w_ppr * norm_ppr + w_embed * norm_embed + anchor."""
+    w_ppr = embed_blend_alpha
+    w_embed = 1.0 - w_ppr
+    anchor = 1.0 if is_anchor else 0.0
+    return (
+        w_ppr * norm_ppr.get(concept_id, 0.0)
+        + w_embed * norm_embed.get(concept_id, 0.0)
+        + catrag_anchor_alpha * anchor
+    )
+
+
+def _min_max_normalize_scores(scores: dict[int, float]) -> dict[int, float]:
+    """Scale ``scores`` to [0, 1] in-place via min-max normalization.
+
+    Returns an empty dict when ``scores`` is empty. Returns a uniform 1.0
+    when all values are identical and positive, 0.0 otherwise — matches
+    ``hybrid._min_max_normalize`` so the two retrievers share the same
+    normalization semantics."""
+    if not scores:
+        return {}
+    values = list(scores.values())
+    minimum = min(values)
+    maximum = max(values)
+    if maximum == minimum:
+        return {cid: 1.0 if maximum > 0.0 else 0.0 for cid in scores}
+    span = maximum - minimum
+    return {cid: (value - minimum) / span for cid, value in scores.items()}
 
 
 def _lookup_concept_id(

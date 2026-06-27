@@ -7,7 +7,13 @@ import os
 import re
 import time
 from concurrent.futures import ThreadPoolExecutor
-from typing import Awaitable, Optional, Union
+from typing import TYPE_CHECKING, Any, Awaitable, Optional, Union
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Sequence
+
+    from open_webui.retrieval.concepts.retrieve.base import RetrievalHit
+    from open_webui.retrieval.concepts.store.protocol import GraphStore
 from urllib.parse import quote
 
 import aiohttp
@@ -50,9 +56,6 @@ from open_webui.utils.headers import include_user_info_headers
 from open_webui.utils.misc import get_message_list
 
 log = logging.getLogger(__name__)
-
-
-from typing import Any
 
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.retrievers import BaseRetriever
@@ -349,8 +352,21 @@ async def query_doc_with_hybrid_search(
     r: float,
     hybrid_bm25_weight: float,
     enable_enriched_texts: bool = False,
+    concept_graph_store: 'GraphStore | None' = None,
+    concept_graph_weight: float | None = None,
+    concept_graph_embed_fn: 'Callable[[str], tuple[float, ...]] | None' = None,
+    concept_graph_reranker: 'Callable[[str, Sequence[RetrievalHit]], list[RetrievalHit]] | None' = None,
+    concept_graph_tiebreaker: str | None = None,
+    concept_graph_embed_alpha: float | None = None,
+    concept_graph_catrag_alpha: float | None = None,
+    **_legacy_kwargs: Any,
 ) -> dict:
     try:
+        if _legacy_kwargs:
+            log.debug(
+                'query_doc_with_hybrid_search: ignoring unknown kwargs: %s',
+                sorted(_legacy_kwargs),
+            )
         # First check if collection_result has the required attributes
         if (
             not collection_result
@@ -410,6 +426,97 @@ async def query_doc_with_hybrid_search(
                 weights=[hybrid_bm25_weight, 1.0 - hybrid_bm25_weight],
                 id_key=CHUNK_HASH_KEY,
             )
+
+        # Optionally add the concept-graph retriever as a third ensemble member.
+        # Gated on CONCEPT_GRAPH_ENABLED + a live store passed by the caller.
+        # The router is called via a bound closure so the adapter doesn't need
+        # to know about RouterConfig.
+        if concept_graph_store is not None:
+            try:
+                from open_webui.config import (
+                    CONCEPT_GRAPH_ENABLED,
+                    CONCEPT_GRAPH_HYBRID_WEIGHT,
+                )
+
+                if CONCEPT_GRAPH_ENABLED.value:
+                    from open_webui.retrieval.concepts.integration.retriever_adapter import (
+                        ConceptGraphRetriever,
+                    )
+                    from open_webui.retrieval.concepts.retrieve.base import RetrievalQuery
+                    from open_webui.retrieval.concepts.retrieve.router import (
+                        RouterConfig,
+                        route,
+                    )
+
+                    # Engage 'ppr_blend_embed' tiebreaker when caller provides a sync embedder.
+                    # Default 'ppr' tiebreaker stays in effect when None.
+                    cg_router_config = RouterConfig(
+                        embed_fn=concept_graph_embed_fn,
+                        tiebreaker=concept_graph_tiebreaker,
+                        embed_blend_alpha=concept_graph_embed_alpha,
+                        catrag_anchor_alpha=concept_graph_catrag_alpha,
+                    )
+
+                    def _cg_retrieve(q: str, n: int):
+                        router_result = route(
+                            RetrievalQuery(text=q, top_k=n),
+                            concept_graph_store,
+                            config=cg_router_config,
+                        )
+                        hits = router_result.hits
+                        if concept_graph_reranker is not None:
+                            try:
+                                hits = concept_graph_reranker(q, hits)
+                            except Exception:
+                                log.warning(
+                                    'concept_graph_reranker failed; using PPR order',
+                                    exc_info=True,
+                                )
+                        return hits
+
+                    cg_retriever = ConceptGraphRetriever(
+                        router_retrieve=_cg_retrieve,
+                        k=k,
+                        collection_name=collection_name,
+                    )
+
+                    cg_weight = (
+                        concept_graph_weight
+                        if concept_graph_weight is not None
+                        else float(CONCEPT_GRAPH_HYBRID_WEIGHT.value)
+                    )
+
+                    # Rebalance: the existing ensemble retains its relative weights;
+                    # we shrink them by (1 - cg_weight) and give cg_retriever the
+                    # cg_weight slice. RRF is rank-based so weights are
+                    # proportional rather than absolute.
+                    existing_weight_scale = 1.0 - cg_weight
+                    new_retrievers = list(ensemble_retriever.retrievers) + [cg_retriever]
+                    new_weights = [
+                        w * existing_weight_scale for w in ensemble_retriever.weights
+                    ] + [cg_weight]
+
+                    ensemble_retriever = EnsembleRetriever(
+                        retrievers=new_retrievers,
+                        weights=new_weights,
+                        id_key=CHUNK_HASH_KEY,
+                    )
+                    log.info(
+                        'query_doc_with_hybrid_search: concept_graph member added '
+                        '(weight=%.3f, existing=%d retriever(s), embed_fn=%s, '
+                        'reranker=%s, tiebreaker=%s, catrag=%s)',
+                        cg_weight,
+                        len(new_retrievers) - 1,
+                        'set' if concept_graph_embed_fn is not None else 'none',
+                        'set' if concept_graph_reranker is not None else 'none',
+                        concept_graph_tiebreaker or 'default',
+                        'set' if concept_graph_catrag_alpha is not None else 'none',
+                    )
+            except Exception:
+                log.exception(
+                    'query_doc_with_hybrid_search: failed to add concept_graph member; '
+                    'falling back to existing ensemble'
+                )
 
         compressor = RerankCompressor(
             embedding_function=embedding_function,
@@ -620,6 +727,13 @@ async def query_collection_with_hybrid_search(
     r: float,
     hybrid_bm25_weight: float,
     enable_enriched_texts: bool = False,
+    concept_graph_store: 'GraphStore | None' = None,
+    concept_graph_weight: float | None = None,
+    concept_graph_embed_fn: 'Callable[[str], tuple[float, ...]] | None' = None,
+    concept_graph_reranker: 'Callable[[str, Sequence[RetrievalHit]], list[RetrievalHit]] | None' = None,
+    concept_graph_tiebreaker: str | None = None,
+    concept_graph_embed_alpha: float | None = None,
+    concept_graph_catrag_alpha: float | None = None,
 ) -> dict:
     results = []
     error = False
@@ -657,6 +771,13 @@ async def query_collection_with_hybrid_search(
                 r=r,
                 hybrid_bm25_weight=hybrid_bm25_weight,
                 enable_enriched_texts=enable_enriched_texts,
+                concept_graph_store=concept_graph_store,
+                concept_graph_weight=concept_graph_weight,
+                concept_graph_embed_fn=concept_graph_embed_fn,
+                concept_graph_reranker=concept_graph_reranker,
+                concept_graph_tiebreaker=concept_graph_tiebreaker,
+                concept_graph_embed_alpha=concept_graph_embed_alpha,
+                concept_graph_catrag_alpha=concept_graph_catrag_alpha,
             )
             return result, None
         except Exception as e:

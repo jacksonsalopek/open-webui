@@ -757,6 +757,168 @@ def test_legacy_tiebreakers_still_work(
     assert tie_order == sorted(tie_order)
 
 
+# ---- Phase 2 PPR + embedding-blend tiebreaker (June 2026) ----
+#
+# These tests pin the contract of ``tiebreaker='ppr_blend_embed'``:
+#   * alpha=1.0 must be equivalent to pure 'ppr' (sanity).
+#   * cosine similarity to query.embedding breaks ties when PPR is equal.
+#   * Missing query.embedding falls back gracefully (no crash, PPR-only).
+#   * Missing concept.embedding scores at 0.0 cosine for that concept.
+#
+# The cross-corpus probe (June 2026) found this blend yields uneven results
+# on untuned corpora — see CONCEPT_GRAPH_PHASE1.md retrospective for the
+# bimodality observation. The mode is opt-in; default tiebreaker is still
+# 'ppr'.
+
+
+def _set_embedding(store: GraphStore, concept_id: int, vec: tuple[float, ...]) -> None:
+    """Helper: normalize and write a concept embedding via the store primitive."""
+    import math as _math
+
+    norm = _math.sqrt(sum(x * x for x in vec)) or 1.0
+    store.set_concept_embedding(concept_id, tuple(x / norm for x in vec))
+
+
+def test_ppr_blend_embed_alpha_one_equivalent_to_pure_ppr() -> None:
+    """alpha=1.0 weights cosine at 0 — should match pure 'ppr' tiebreaker."""
+    store = InMemoryGraphStore()
+    ids = _build_hub_vs_local_graph(store)
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0,) + (0.0,) * 7,
+        seed_concept_ids=(ids['anchor'],),
+        top_k=10,
+    )
+    base_config = dict(
+        radius=2,
+        seed_filter=SeedFilter.NONE,
+        include_seeds_as_hits=False,
+    )
+    for cid in ids.values():
+        _set_embedding(store, cid, (1.0,) + (0.0,) * 7)
+
+    pure_ppr = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(tiebreaker='ppr', **base_config),
+    ).retrieve(query, store)
+    blend_alpha_one = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            tiebreaker='ppr_blend_embed',
+            embed_blend_alpha=1.0,
+            **base_config,
+        ),
+    ).retrieve(query, store)
+
+    pure_order = [h.concept.id for h in pure_ppr if h.concept]
+    blend_order = [h.concept.id for h in blend_alpha_one if h.concept]
+    assert pure_order == blend_order, (
+        f'alpha=1.0 should be equivalent to pure PPR; '
+        f'pure={pure_order} blend={blend_order}'
+    )
+
+
+def test_ppr_blend_embed_breaks_ties_by_cosine_when_alpha_below_one() -> None:
+    """When two candidates have identical PPR, the one whose embedding is
+    closer to query.embedding should rank first."""
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    near = _upsert(store, _concept('near_query'))
+    far = _upsert(store, _concept('far_from_query'))
+    _link(store, anchor, near, weight=1.0)
+    _link(store, anchor, far, weight=1.0)
+
+    query_vec = (1.0, 0.0, 0.0, 0.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, near, (0.95, 0.31, 0.0, 0.0))
+    _set_embedding(store, far, (-0.95, 0.31, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=query_vec,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='ppr_blend_embed',
+            embed_blend_alpha=0.5,
+        ),
+    ).retrieve(query, store)
+
+    order = [h.concept.id for h in hits if h.concept]
+    assert near in order and far in order
+    assert order.index(near) < order.index(far), (
+        f'Concept with embedding closer to query should rank first; '
+        f'order={order} near={near} far={far}'
+    )
+
+
+def test_ppr_blend_embed_falls_back_when_query_embedding_missing() -> None:
+    """No query.embedding -> blend cosine component is uniformly 0; ranking
+    must still be deterministic (PPR carries the signal) and not raise."""
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    neighbor_a = _upsert(store, _concept('neighbor_a'))
+    neighbor_b = _upsert(store, _concept('neighbor_b'))
+    _link(store, anchor, neighbor_a)
+    _link(store, anchor, neighbor_b)
+
+    query = RetrievalQuery(
+        text='',
+        embedding=None,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='ppr_blend_embed',
+            embed_blend_alpha=0.5,
+        ),
+    ).retrieve(query, store)
+    assert hits
+    assert all(h.concept is not None for h in hits)
+
+
+def test_ppr_blend_embed_handles_missing_concept_embedding() -> None:
+    """Concepts without an embedding should not raise; they score at 0.0
+    cosine and fall back to the secondary (PPR-only) tiebreaker."""
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    with_emb = _upsert(store, _concept('has_embed'))
+    without_emb = _upsert(store, _concept('no_embed'))
+    _link(store, anchor, with_emb, weight=1.0)
+    _link(store, anchor, without_emb, weight=1.0)
+    _set_embedding(store, with_emb, (1.0, 0.0, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0, 0.0, 0.0, 0.0),
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='ppr_blend_embed',
+            embed_blend_alpha=0.3,
+        ),
+    ).retrieve(query, store)
+
+    order = [h.concept.id for h in hits if h.concept]
+    assert with_emb in order and without_emb in order
+    assert order.index(with_emb) < order.index(without_emb), (
+        f'Concept with matching embedding should outrank embedding-less '
+        f'concept when cosine has weight; order={order}'
+    )
+
+
 def test_ppr_skipped_when_seeds_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -774,3 +936,297 @@ def test_ppr_skipped_when_seeds_empty(
     query = RetrievalQuery(text='nonexistent tokens xyz', top_k=10)
     assert retriever.retrieve(query, store) == []
     assert not called
+
+
+# ---- Phase 2 CatRAG tiebreaker (W5) ----
+
+
+def test_catrag_tiebreaker_degenerates_to_ppr_blend_embed_when_no_phrases() -> None:
+    """With empty glossary phrases, catrag should match ppr_blend_embed order."""
+    store = InMemoryGraphStore()
+    ids = _build_hub_vs_local_graph(store)
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0,) + (0.0,) * 7,
+        seed_concept_ids=(ids['anchor'],),
+        top_k=10,
+    )
+    base_config = dict(
+        radius=2,
+        seed_filter=SeedFilter.NONE,
+        include_seeds_as_hits=False,
+        embed_blend_alpha=0.5,
+    )
+    for cid in ids.values():
+        _set_embedding(store, cid, (1.0,) + (0.0,) * 7)
+
+    blend_hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            tiebreaker='ppr_blend_embed',
+            catrag_anchor_alpha=0.2,
+            **base_config,
+        ),
+    ).retrieve(query, store)
+    catrag_hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            tiebreaker='catrag',
+            catrag_anchor_alpha=0.2,
+            catrag_glossary_phrases=(),
+            **base_config,
+        ),
+    ).retrieve(query, store)
+
+    blend_order = [h.concept.id for h in blend_hits if h.concept]
+    catrag_order = [h.concept.id for h in catrag_hits if h.concept]
+    assert catrag_order == blend_order
+
+
+def test_catrag_anchor_bonus_promotes_concept_named_in_phrase() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    selection = _upsert(store, _concept('selection'))
+    widget = _upsert(store, _concept('widget'))
+    _link(store, anchor, selection, weight=1.0)
+    _link(store, anchor, widget, weight=1.0)
+
+    query_vec = (1.0, 0.0, 0.0, 0.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, selection, (0.5, 0.5, 0.0, 0.0))
+    _set_embedding(store, widget, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=query_vec,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.5,
+            catrag_glossary_phrases=('selection capture',),
+        ),
+    ).retrieve(query, store)
+
+    order = [h.concept.id for h in hits if h.concept]
+    assert selection in order and widget in order
+    assert order.index(selection) < order.index(widget)
+
+
+def test_catrag_anchor_bonus_case_insensitive() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    selection = _upsert(store, _concept('selection'))
+    widget = _upsert(store, _concept('widget'))
+    _link(store, anchor, selection, weight=1.0)
+    _link(store, anchor, widget, weight=1.0)
+
+    query_vec = (1.0, 0.0, 0.0, 0.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, selection, (0.5, 0.5, 0.0, 0.0))
+    _set_embedding(store, widget, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=query_vec,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.5,
+            catrag_glossary_phrases=('Selection Capture',),
+        ),
+    ).retrieve(query, store)
+
+    order = [h.concept.id for h in hits if h.concept]
+    assert order.index(selection) < order.index(widget)
+    widget_hit = next(h for h in hits if h.concept and h.concept.id == widget)
+    assert widget_hit.provenance['catrag_is_anchor'] is False
+    selection_hit = next(h for h in hits if h.concept and h.concept.id == selection)
+    assert selection_hit.provenance['catrag_is_anchor'] is True
+
+
+def test_catrag_anchor_bonus_substring_match() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    toolbar = _upsert(store, _concept('toolbar'))
+    widget = _upsert(store, _concept('widget'))
+    _link(store, anchor, toolbar, weight=1.0)
+    _link(store, anchor, widget, weight=1.0)
+
+    query_vec = (1.0, 0.0, 0.0, 0.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, toolbar, (0.5, 0.5, 0.0, 0.0))
+    _set_embedding(store, widget, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=query_vec,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.5,
+            catrag_glossary_phrases=('floating toolbar popup',),
+        ),
+    ).retrieve(query, store)
+
+    order = [h.concept.id for h in hits if h.concept]
+    assert order.index(toolbar) < order.index(widget)
+
+
+def test_catrag_no_bonus_when_alpha_zero() -> None:
+    store = InMemoryGraphStore()
+    ids = _build_hub_vs_local_graph(store)
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0,) + (0.0,) * 7,
+        seed_concept_ids=(ids['anchor'],),
+        top_k=10,
+    )
+    base_config = dict(
+        radius=2,
+        seed_filter=SeedFilter.NONE,
+        include_seeds_as_hits=False,
+        embed_blend_alpha=0.5,
+        catrag_glossary_phrases=('selection capture',),
+    )
+    for cid in ids.values():
+        _set_embedding(store, cid, (1.0,) + (0.0,) * 7)
+
+    blend_hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(tiebreaker='ppr_blend_embed', **base_config),
+    ).retrieve(query, store)
+    catrag_none = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            tiebreaker='catrag',
+            catrag_anchor_alpha=None,
+            **base_config,
+        ),
+    ).retrieve(query, store)
+    catrag_zero = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            tiebreaker='catrag',
+            catrag_anchor_alpha=0.0,
+            **base_config,
+        ),
+    ).retrieve(query, store)
+
+    blend_order = [h.concept.id for h in blend_hits if h.concept]
+    assert [h.concept.id for h in catrag_none if h.concept] == blend_order
+    assert [h.concept.id for h in catrag_zero if h.concept] == blend_order
+
+
+def test_catrag_provenance_carries_diagnostics() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    toolbar = _upsert(store, _concept('toolbar'))
+    _link(store, anchor, toolbar, weight=1.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, toolbar, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0, 0.0, 0.0, 0.0),
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.2,
+            catrag_glossary_phrases=('floating toolbar popup',),
+        ),
+    ).retrieve(query, store)
+
+    assert hits
+    for hit in hits:
+        assert 'catrag_anchor_alpha' in hit.provenance
+        assert 'catrag_is_anchor' in hit.provenance
+        assert 'catrag_score' in hit.provenance
+        assert isinstance(hit.provenance['catrag_is_anchor'], bool)
+        assert isinstance(hit.provenance['catrag_score'], float)
+
+
+def test_catrag_skips_empty_concept_names() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    empty_name = _upsert(store, _concept(''))
+    named = _upsert(store, _concept('toolbar'))
+    _link(store, anchor, empty_name, weight=1.0)
+    _link(store, anchor, named, weight=1.0)
+
+    query_vec = (1.0, 0.0, 0.0, 0.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, empty_name, (0.5, 0.5, 0.0, 0.0))
+    _set_embedding(store, named, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=query_vec,
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            include_seeds_as_hits=False,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.5,
+            catrag_glossary_phrases=('floating toolbar popup',),
+        ),
+    ).retrieve(query, store)
+
+    empty_hit = next(h for h in hits if h.concept and h.concept.id == empty_name)
+    named_hit = next(h for h in hits if h.concept and h.concept.id == named)
+    assert empty_hit.provenance['catrag_is_anchor'] is False
+    assert named_hit.provenance['catrag_is_anchor'] is True
+
+
+def test_catrag_anchor_handles_special_chars() -> None:
+    store = InMemoryGraphStore()
+    anchor = _upsert(store, _concept('anchor'))
+    neighbor = _upsert(store, _concept('neighbor'))
+    _link(store, anchor, neighbor, weight=1.0)
+    _set_embedding(store, anchor, (0.0, 1.0, 0.0, 0.0))
+    _set_embedding(store, neighbor, (0.5, 0.5, 0.0, 0.0))
+
+    query = RetrievalQuery(
+        text='',
+        embedding=(1.0, 0.0, 0.0, 0.0),
+        seed_concept_ids=(anchor,),
+        top_k=10,
+    )
+    hits = NeighborhoodRetriever(
+        NeighborhoodRetrieverConfig(
+            radius=1,
+            seed_filter=SeedFilter.NONE,
+            tiebreaker='catrag',
+            embed_blend_alpha=0.5,
+            catrag_anchor_alpha=0.2,
+            catrag_glossary_phrases=('.*',),
+        ),
+    ).retrieve(query, store)
+
+    assert hits

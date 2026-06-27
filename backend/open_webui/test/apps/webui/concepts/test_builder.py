@@ -18,12 +18,6 @@ from open_webui.retrieval.concepts.store.memory_store import InMemoryGraphStore
 
 _TS = datetime(2025, 6, 1, 12, 0, 0, tzinfo=timezone.utc)
 
-_LOLLIPOP_VIEWMODELS = Path('/tmp/lollipop_subset')
-_LOLLIPOP_HOST = Path(
-    '/Users/jacksonsalopek/dev/startups/ventana/lollipop/src/Lollipop/ViewModels',
-)
-
-
 def _count_co_occurrence_edges(store: InMemoryGraphStore) -> int:
     return sum(1 for key in store._edges if key[0] == EdgeType.CO_OCCURS_WITH)
 
@@ -272,66 +266,23 @@ def test_build_records_per_phase_progress_callback(tmp_path: Path) -> None:
     ]
 
 
-def _synthetic_csharp_tree(root: Path) -> None:
-    """Representative mini C# tree when Lollipop mount is unavailable."""
-    (root / 'ViewModels').mkdir(parents=True, exist_ok=True)
-    (root / 'Services').mkdir(parents=True, exist_ok=True)
-    (root / 'ViewModels' / 'ToolbarViewModel.cs').write_text(
-        '''
-public sealed partial class ToolbarViewModel : ObservableObject
-{
-    private readonly SelectionService _selection;
-    private readonly ExtensionSettingsService _extensionSettings;
-    private readonly DispatcherQueue _dispatcher;
-    public void ExecuteExtension() { }
-    private void CancelActiveRun() { }
-}
-''',
-        encoding='utf-8',
-    )
-    (root / 'ViewModels' / 'SettingsViewModel.cs').write_text(
-        '''
-public sealed class SettingsViewModel
-{
-    private readonly ExtensionSettingsService _extensionSettings;
-    public void SaveSettings() { }
-}
-''',
-        encoding='utf-8',
-    )
-    (root / 'Services' / 'SelectionService.cs').write_text(
-        '''
-public sealed class SelectionService
-{
-    public string CurrentSelection { get; private set; }
-    public void UpdateSelection(string value) { CurrentSelection = value; }
-}
-''',
-        encoding='utf-8',
-    )
+def test_build_lollipop_subset_sanity(lollipop_subset_store: InMemoryGraphStore) -> None:
+    """Sanity check that the W9-A reproducible fixture builds a non-trivial graph.
 
-
-def test_build_lollipop_subset_sanity(tmp_path: Path) -> None:
-    if _LOLLIPOP_VIEWMODELS.is_dir() and any(_LOLLIPOP_VIEWMODELS.glob('*.cs')):
-        roots = (_LOLLIPOP_VIEWMODELS,)
-        source = 'container /tmp/lollipop_subset'
-    elif _LOLLIPOP_HOST.is_dir():
-        roots = (_LOLLIPOP_HOST,)
-        source = 'host Lollipop ViewModels'
-    else:
-        _synthetic_csharp_tree(tmp_path)
-        roots = (tmp_path,)
-        source = 'synthetic tmp_path fixture'
-
-    store = InMemoryGraphStore()
-    plan = BuildPlan(
-        roots=roots,
-        language_hint='csharp',
-        builder_prune=BuilderPruneOptions(min_cooccurrence_weight=1),
+    Replaces the legacy 3-file fallback variant of this test. Assertions are
+    scaled to the broader corpus composition documented in
+    scripts/build_lollipop_fixture.sh (81 .cs files across 5 subdirs).
+    """
+    store = lollipop_subset_store
+    concepts = list(store._concepts.values())
+    assert len(concepts) >= 500, (
+        f'expected at least 500 concepts from the lollipop subset fixture; '
+        f'got {len(concepts)}'
     )
-    result = build(plan, store)
-
-    assert result.files_extracted >= 1, f'no files from {source}'
-    assert result.chunks_extracted >= 1
-    assert result.concepts_upserted >= 50
-    assert result.edges_persisted >= 50
+    kinds = {c.kind for c in concepts}
+    assert ConceptKind.ATOMIC in kinds, (
+        f'expected atomic concepts in the graph; saw {kinds}'
+    )
+    assert ConceptKind.PHRASE in kinds or ConceptKind.ROLE in kinds, (
+        f'expected glossary-derived phrase/role concepts; saw {kinds}'
+    )

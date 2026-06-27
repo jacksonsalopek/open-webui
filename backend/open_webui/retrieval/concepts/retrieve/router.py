@@ -165,6 +165,23 @@ class RouterConfig:
     they need to survive IDF-based tiebreaking. Acceptance tests bump this
     to ~400 to widen the per-seed frontier."""
 
+    tiebreaker: str | None = None
+    """Override for the underlying ``NeighborhoodRetrieverConfig.tiebreaker``.
+    ``None`` leaves the retriever default (``'ppr'``) in place. Set to
+    ``'ppr_blend_embed'`` to engage the Phase 2 embedding blend; requires
+    ``embed_fn`` to be configured and concept embeddings present on the
+    store."""
+
+    embed_blend_alpha: float | None = None
+    """Override for ``NeighborhoodRetrieverConfig.embed_blend_alpha``. Only
+    meaningful when ``tiebreaker='ppr_blend_embed'``. ``None`` keeps the
+    retriever default (0.5)."""
+
+    catrag_anchor_alpha: float | None = None
+    """Override for ``NeighborhoodRetrieverConfig.catrag_anchor_alpha``. Only
+    meaningful when ``tiebreaker='catrag'``. ``None`` keeps the retriever
+    default (effectively 0.0 — no anchor bonus)."""
+
 
 def classify_intent(
     text: str,
@@ -200,6 +217,22 @@ def route(
     """Classify + dispatch + retrieve."""
     cfg = config or RouterConfig()
     started = time.perf_counter()
+
+    # Precompute query embedding once when an embedder is configured but the
+    # caller didn't supply one. This makes ``query.embedding`` available to
+    # every downstream retriever path (including the seeded neighborhood
+    # paths that previously ignored embeddings), enabling the
+    # ``'ppr_blend_embed'`` tiebreaker without each route_* helper needing
+    # to re-invoke the embedder.
+    if cfg.embed_fn is not None and query.embedding is None:
+        query = RetrievalQuery(
+            text=query.text,
+            embedding=cfg.embed_fn(query.text),
+            seed_concept_ids=query.seed_concept_ids,
+            top_k=query.top_k,
+            edge_types_filter=query.edge_types_filter,
+            kind_filter=query.kind_filter,
+        )
 
     classified = classify_intent(query.text, config=cfg)
     hits, retriever_used = _dispatch(classified, query, store, cfg)
@@ -411,6 +444,7 @@ def _route_find_symbol(
     retriever = NeighborhoodRetriever(
         _neighborhood_config(
             cfg,
+            classified=classified,
             radius=1,
             edge_types=(EdgeType.DEFINES, EdgeType.IS_NAMED_IN),
             seed_filter=SeedFilter.NONE,
@@ -438,6 +472,7 @@ def _route_where_used(
     retriever = NeighborhoodRetriever(
         _neighborhood_config(
             cfg,
+            classified=classified,
             radius=1,
             edge_types=(EdgeType.REFERENCES, EdgeType.CO_OCCURS_WITH),
             seed_filter=SeedFilter.NONE,
@@ -467,6 +502,7 @@ def _route_find_concept(
     retriever = NeighborhoodRetriever(
         _neighborhood_config(
             cfg,
+            classified=classified,
             radius=cfg.neighborhood_radius_default,
             seed_filter=SeedFilter.NONE,
         ),
@@ -493,6 +529,7 @@ def _route_explain_region(
         retriever = NeighborhoodRetriever(
             _neighborhood_config(
                 cfg,
+                classified=classified,
                 radius=cfg.neighborhood_radius_default,
                 seed_filter=SeedFilter.NONE,
             ),
@@ -573,6 +610,7 @@ def _resolve_all_seeds(
 def _neighborhood_config(
     cfg: RouterConfig,
     *,
+    classified: ClassifiedIntent | None = None,
     radius: int,
     seed_filter: SeedFilter,
     edge_types: tuple[EdgeType, ...] | None = None,
@@ -588,6 +626,14 @@ def _neighborhood_config(
         kwargs['edge_types'] = edge_types
     if cfg.max_neighbors_per_seed is not None:
         kwargs['max_neighbors_per_seed'] = cfg.max_neighbors_per_seed
+    if cfg.tiebreaker is not None:
+        kwargs['tiebreaker'] = cfg.tiebreaker
+    if cfg.embed_blend_alpha is not None:
+        kwargs['embed_blend_alpha'] = cfg.embed_blend_alpha
+    if cfg.catrag_anchor_alpha is not None:
+        kwargs['catrag_anchor_alpha'] = cfg.catrag_anchor_alpha
+    if cfg.tiebreaker == 'catrag' and classified is not None:
+        kwargs['catrag_glossary_phrases'] = classified.extracted_phrases
     return NeighborhoodRetrieverConfig(**kwargs)
 
 

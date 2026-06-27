@@ -139,3 +139,400 @@ phrases:
       A composable pipeline component that intercepts requests or messages
       to add cross-cutting behavior such as logging or authentication.
     tags: [architecture]
+
+  # --- W10-B additions (Phase 1.5 P0-5) ---
+
+  # UI Automation (UIA) control patterns — multi-token COM pattern names.
+  - name: invoke-pattern
+    surface_forms: [invoke pattern, InvokePattern, IInvokeProvider]
+    definition: |
+      UIA control pattern for elements that expose a default action invokable
+      by assistive technology or automation clients.
+    tags: [uia, accessibility, win32]
+
+  - name: selection-pattern
+    surface_forms: [selection pattern, SelectionPattern, ISelectionProvider]
+    definition: |
+      UIA control pattern for containers that manage a selectable subset of
+      child elements and report the current selection.
+    tags: [uia, accessibility, win32]
+
+  - name: value-pattern
+    surface_forms: [value pattern, ValuePattern, IValueProvider]
+    definition: |
+      UIA control pattern for controls that expose a simple scalar value
+      readable and writable without a separate text interface.
+    tags: [uia, accessibility, win32]
+
+  - name: text-pattern
+    surface_forms: [TextPattern, IUIAutomationTextPattern, UIA_TextPatternId]
+    definition: |
+      UIA control pattern for reading, selecting, and navigating structured
+      text in a document or editable field via COM interfaces.
+    tags: [uia, accessibility, win32]
+
+  - name: toggle-pattern
+    surface_forms: [toggle pattern, TogglePattern, IToggleProvider]
+    definition: |
+      UIA control pattern for on/off controls such as checkboxes that report
+      and change a binary toggle state.
+    tags: [uia, accessibility, win32]
+
+  - name: expand-collapse-pattern
+    surface_forms: [expand collapse pattern, ExpandCollapsePattern, IExpandCollapseProvider]
+    definition: |
+      UIA control pattern for elements that can expand to reveal content or
+      collapse to hide it, such as tree nodes and accordions.
+    tags: [uia, accessibility, win32]
+
+  - name: range-value-pattern
+    surface_forms: [range value pattern, RangeValuePattern, IRangeValueProvider]
+    definition: |
+      UIA control pattern for controls with a bounded numeric value such as
+      sliders, spinners, and progress indicators.
+    tags: [uia, accessibility, win32]
+
+  - name: scroll-pattern
+    surface_forms: [scroll pattern, ScrollPattern, IScrollProvider]
+    definition: |
+      UIA control pattern for scrollable containers that expose horizontal
+      and vertical scroll capabilities and visible viewport bounds.
+    tags: [uia, accessibility, win32]
+
+  # Win32 / Windows hooks and hook installation APIs.
+  - name: windows-hook
+    surface_forms: [windows hook, Windows hook, Win32 hook]
+    definition: |
+      A Win32 mechanism that intercepts system or thread events by installing
+      a callback invoked before messages reach their target.
+    tags: [win32, hooks]
+
+  - name: wh-keyboard-ll
+    surface_forms: [WH_KEYBOARD_LL, wh keyboard ll, low-level keyboard hook]
+    definition: |
+      Win32 low-level keyboard hook constant (13) that receives keyboard input
+      events system-wide before they reach the foreground thread.
+    tags: [win32, hooks]
+
+  - name: wh-mouse-ll
+    surface_forms: [WH_MOUSE_LL, wh mouse ll, low-level mouse hook]
+    definition: |
+      Win32 low-level mouse hook constant (14) that receives mouse input
+      events system-wide, including button and wheel actions.
+    tags: [win32, hooks]
+
+  - name: winevent-hook
+    surface_forms: [WinEvent hook, winevent hook, SetWinEventHook]
+    definition: |
+      Win32 accessibility hook that notifies clients when UIAutomation or
+      accessible object events fire in the desktop window tree.
+    tags: [win32, hooks, accessibility]
+
+  - name: set-windows-hook-ex
+    surface_forms: [SetWindowsHookEx, set windows hook ex, SetWindowsHookExW]
+    definition: |
+      Win32 API that installs a thread or global hook procedure for a given
+      hook type such as WH_KEYBOARD_LL or WH_MOUSE_LL.
+    tags: [win32, hooks, api]
+
+  - name: low-level-hook
+    surface_forms: [low level hook, low-level hook, LL hook]
+    definition: |
+      A Win32 hook installed at WH_*_LL scope that runs in the installing
+      process and observes input before it is dispatched to targets.
+    tags: [win32, hooks]
+
+  # Accessibility API surface — element identity and tree navigation.
+  - name: uiautomation-element
+    surface_forms: [AutomationElement, IUIAutomationElement, UI Automation element]
+    definition: |
+      The root COM interface representing one node in the UI Automation tree
+      with properties, control patterns, and parent/child relationships.
+    tags: [uia, accessibility, win32]
+
+  - name: iaccessible
+    surface_forms: [IAccessible, MSAA accessible, legacy accessible object]
+    definition: |
+      Legacy Microsoft Active Accessibility COM interface exposing name,
+      role, state, and value for screen readers and automation tools.
+    tags: [accessibility, win32, msaa]
+
+  - name: automation-id
+    surface_forms: [AutomationId, automation id, UIA AutomationId property]
+    definition: |
+      UI Automation property that assigns a stable developer-defined identifier
+      to a control for test and assistive-technology lookup.
+    tags: [uia, accessibility, testing]
+
+  - name: accessibility-tree
+    surface_forms: [accessibility tree, a11y tree, accessibility hierarchy]
+    definition: |
+      The hierarchical representation of UI elements exposed to assistive
+      technology via UI Automation or MSAA traversal APIs.
+    tags: [accessibility, uia]
+
+  # Prompt engineering and LLM guardrail vocabulary.
+  - name: system-prompt
+    surface_forms: [system prompt, system message, system instruction]
+    definition: |
+      The model-facing instruction block that sets role, constraints, and
+      task context before user or tool messages in a completion request.
+    tags: [llm, prompting]
+
+  - name: tool-call
+    surface_forms: [tool call, function call, tool calling]
+    definition: |
+      A structured model output that requests execution of an external tool
+      or function with named arguments rather than plain text.
+    tags: [llm, agents]
+
+  - name: prompt-injection
+    surface_forms: [prompt injection, jailbreak attempt, instruction override]
+    definition: |
+      An adversarial input that tries to override system instructions or
+      elicit disallowed behavior from a language model.
+    tags: [llm, security]
+
+  - name: guardrail-policy
+    surface_forms: [guardrail policy, prompt guardrail, output guardrail]
+    definition: |
+      A rule set that validates model inputs or outputs and triggers fallback
+      behavior when responses fail safety or quality checks.
+    tags: [llm, safety]
+
+  - name: safety-guardrail
+    surface_forms: [safety guardrail, content guardrail, response guardrail]
+    definition: |
+      A guardrail focused on blocking harmful, off-topic, or non-transformative
+      model outputs before they reach the user interface.
+    tags: [llm, safety]
+
+  # Lollipop-specific multi-token terms confirmed in the W9-A fixture corpus.
+  - name: selection-gesture
+    surface_forms: [selection gesture, SelectionGestureDetected, SelectionGestureEventArgs]
+    definition: |
+      The mouse gesture sequence detected by GlobalHookService that signals
+      the user highlighted text in an external application.
+    tags: [lollipop, hooks, selection]
+
+  - name: clipboard-snapshot
+    surface_forms: [clipboard snapshot, ClipboardSnapshot, CaptureClipboardSnapshot]
+    definition: |
+      A saved copy of clipboard formats taken before SendInput simulates
+      copy so selection capture can restore prior clipboard contents.
+    tags: [lollipop, clipboard, selection]
+
+  - name: llm-completion
+    surface_forms: [llm completion, LlmCompletionOptions, completion request]
+    definition: |
+      A single language-model generation call parameterized by max tokens,
+      temperature, and backend-specific options in Lollipop.Llm.
+    tags: [lollipop, llm]
+
+  - name: global-hook-service
+    surface_forms: [GlobalHookService, global hook service, system-wide hook]
+    definition: |
+      Lollipop service that installs WH_MOUSE_LL and WH_KEYBOARD_LL hooks on
+      a dedicated STA thread to detect selection gestures and Esc dismiss.
+    tags: [lollipop, hooks, win32]
+
+  - name: chat-response
+    surface_forms: [chat response, ChatResponsePatterns, LooksLikeChatResponse]
+    definition: |
+      Conversational model output detected by PromptGuardrails when a small
+      model replies instead of performing the requested text transformation.
+    tags: [lollipop, llm, guardrails]
+
+  # --- end W10-B additions ---
+
+  # --- WinUI 3 / .NET 10 modern desktop vocabulary (zap experiment, 2026-06-26) ---
+  #
+  # Generic WinUI 3 terms-of-art surfaced by the zap cross-corpus probe.
+  # NOT zap-specific — these phrases should help any WinUI 3 / modern Windows
+  # desktop codebase (Mica, custom title bar, .appinstaller updates, named-pipe
+  # single-instance, IExplorerCommand shell extensions, etc.).
+
+  # Visual surface — Mica, Acrylic, custom title bar, Fluent.
+  - name: mica-backdrop
+    surface_forms: [Mica, MicaBackdrop, mica backdrop, mica blur, modern Windows blur, Windows 11 blur]
+    definition: |
+      WinUI 3 system backdrop that paints a desktop-wallpaper-tinted blur on
+      a window's non-client area. The "modern Windows" visual on Windows 11
+      apps; set via Window.SystemBackdrop = new MicaBackdrop().
+    tags: [winui, visual, windows11]
+
+  - name: system-backdrop
+    surface_forms: [SystemBackdrop, system backdrop, ISystemBackdrop, window backdrop]
+    definition: |
+      The WinUI 3 abstraction for window-chrome blur effects (MicaBackdrop,
+      AcrylicBackdrop, DesktopAcrylicBackdrop). Replaces the legacy WPF
+      WindowChrome path on Windows 11.
+    tags: [winui, visual]
+
+  - name: acrylic-backdrop
+    surface_forms: [AcrylicBackdrop, DesktopAcrylicBackdrop, acrylic backdrop, acrylic blur]
+    definition: |
+      WinUI 3 system backdrop that paints a translucent acrylic blur tinted
+      with the user's accent color. Sibling of MicaBackdrop; preferred for
+      transient surfaces like flyouts.
+    tags: [winui, visual]
+
+  - name: custom-title-bar
+    surface_forms: [custom title bar, AppTitleBar, ExtendsContentIntoTitleBar, AppWindowTitleBar, title bar customization]
+    definition: |
+      WinUI 3 pattern where the app extends content into the title bar region
+      and draws its own caption controls, enabling Mica blur and Fluent
+      Design under the window chrome.
+    tags: [winui, visual]
+
+  - name: fluent-design
+    surface_forms: [Fluent Design, Fluent UI, FluentDesignSystem, Microsoft Fluent]
+    definition: |
+      Microsoft's design system for Windows apps: depth, motion, material
+      (Mica/Acrylic), and accent-aware typography. The visual language WinUI
+      apps target out of the box.
+    tags: [winui, visual]
+
+  - name: immersive-dark-mode
+    surface_forms: [DWMWA_USE_IMMERSIVE_DARK_MODE, immersive dark mode, DwmSetWindowAttribute, dark title bar]
+    definition: |
+      Win32 DWM attribute that paints the non-client window chrome in dark
+      colors when the app's RequestedTheme is Dark, even on Windows 10 builds
+      that don't honor the theme automatically.
+    tags: [win32, theming]
+
+  - name: element-theme
+    surface_forms: [ElementTheme, RequestedTheme, element theme, theme mode]
+    definition: |
+      WinUI 3 enum for per-FrameworkElement theme (Default / Light / Dark).
+      The root element's RequestedTheme cascades to descendants and drives
+      Mica tint and Fluent palette.
+    tags: [winui, theming]
+
+  - name: application-data
+    surface_forms: [ApplicationData, ApplicationDataContainer, LocalSettings, RoamingSettings, application data store]
+    definition: |
+      WinRT API for per-app persistent settings and files. LocalSettings is
+      the keyed key-value store apps use for theme, prefs, and lightweight
+      config that survives across launches.
+    tags: [winrt, persistence]
+
+  # WinUI 3 platform identity.
+  - name: winui
+    surface_forms: [WinUI, WinUI 3, Microsoft.UI.Xaml, Windows App SDK]
+    definition: |
+      Microsoft's native UI framework for Windows desktop apps, evolved from
+      UWP XAML. Ships in the Windows App SDK; replaces WPF/WinForms for new
+      modern Windows apps.
+    tags: [winui]
+
+  # Single-instance / inter-process activation.
+  - name: single-instance
+    surface_forms: [single instance, single-instance, single-instancing, AppInstance.FindOrRegisterForKey]
+    definition: |
+      Pattern that enforces only one running copy of an app: a second launch
+      detects the running instance, forwards its activation arguments, and
+      exits. Implemented via named mutex + named pipe, or via WinUI's
+      AppInstance API.
+    tags: [winui, ipc]
+
+  - name: named-mutex
+    surface_forms: [named mutex, NamedMutex, system-wide mutex, named Mutex, Mutex acquire]
+    definition: |
+      A Win32/CLR mutex with a system-wide name that any process can attempt
+      to acquire. The first acquirer is the "primary" instance; subsequent
+      acquirers fail and know an instance is already running.
+    tags: [win32, ipc, concurrency]
+
+  - name: named-pipe
+    surface_forms: [named pipe, NamedPipe, NamedPipeServerStream, NamedPipeClientStream, named-pipe IPC]
+    definition: |
+      A Win32 inter-process channel identified by a string name. Used by
+      single-instance apps to forward command-line arguments from a second
+      launch to the running primary instance.
+    tags: [win32, ipc]
+
+  - name: protocol-activation
+    surface_forms: [protocol activation, ProtocolActivation, URI activation, AppActivationArguments, OnLaunched]
+    definition: |
+      Windows app activation kind where the OS launches the app with a custom
+      URI scheme as payload, distinct from file or command-line activation.
+      Routed through AppActivationArguments in WinUI 3.
+    tags: [winui, activation]
+
+  # Image format vocabulary — atomic tokenization splits these awkwardly
+  # (Webp -> [web, p]) so phrase entries are the reliable surface.
+  - name: webp-format
+    surface_forms: [WebP, webp, .webp, image/webp, WebP image, webp encoder]
+    definition: |
+      Google's modern lossy/lossless image format with strong compression at
+      photographic and graphic quality. Represented as ImageFormat.Webp in
+      most .NET image processing pipelines.
+    tags: [image, format]
+
+  - name: jpeg-format
+    surface_forms: [JPEG, jpeg, .jpg, .jpeg, image/jpeg, JPEG image, jpeg encoder]
+    definition: |
+      Lossy DCT-based image format. The default photographic encoding;
+      represented as ImageFormat.Jpeg in .NET.
+    tags: [image, format]
+
+  - name: png-format
+    surface_forms: [PNG, png, .png, image/png, PNG image, png encoder]
+    definition: |
+      Lossless deflate-compressed raster image format with alpha channel.
+      Represented as ImageFormat.Png in .NET.
+    tags: [image, format]
+
+  - name: libvips
+    surface_forms: [libvips, vips, NetVips, VipsImage, VipsImageProcessor]
+    definition: |
+      A streaming image processing library known for low-memory throughput on
+      large rasters. NetVips is the .NET binding; commonly used as the
+      compression engine for PNG / JPEG / WebP image-tools desktop apps.
+    tags: [image, library]
+
+  # Update / packaging — .appinstaller is the modern Windows sideload format.
+  - name: app-installer
+    surface_forms: [AppInstaller, .appinstaller, app installer, app-installer file, MSIX AppInstaller]
+    definition: |
+      Microsoft XML format for MSIX sideload distribution that adds optional
+      auto-update metadata. Triple-click installs and, when an UpdateUri is
+      set, the OS will pull updates from that URL on launch.
+    tags: [packaging, msix]
+
+  - name: msix-package
+    surface_forms: [MSIX, msix, MSIX package, .msix, AppxManifest, MSIX bundle]
+    definition: |
+      The modern Windows app packaging format. Each app gets a virtualized
+      install root and signed manifest; supersedes MSI and AppX for new
+      desktop apps.
+    tags: [packaging]
+
+  # Shell extension surface — IExplorerCommand context menus.
+  - name: explorer-command
+    surface_forms: [IExplorerCommand, ExplorerCommand, explorer command, modern context menu, IExplorerCommandState]
+    definition: |
+      Windows 11 modern Explorer context menu integration COM interface. An
+      IExplorerCommand implementation contributes a top-level right-click
+      entry filtered by file type via a sparse package registration.
+    tags: [shell, win32, com]
+
+  - name: shell-context-menu
+    surface_forms: [shell context menu, context menu, right-click menu, file context menu, Explorer context menu]
+    definition: |
+      The right-click menu Explorer shows for a selected file or folder.
+      Modern (Windows 11) extensions register via IExplorerCommand; legacy
+      extensions used IShellExtInit / IContextMenu.
+    tags: [shell, win32]
+
+  # Command palette — keyboard-driven launcher pattern.
+  - name: command-palette
+    surface_forms: [command palette, CommandPalette, Ctrl+K, command launcher, action launcher, fuzzy command finder]
+    definition: |
+      A keyboard-invoked overlay that fuzzy-filters a list of registered
+      commands and executes the selected one on Enter. Popularized by
+      VS Code; common in modern desktop apps for power-user navigation.
+    tags: [ui, keyboard]
+
+  # --- end zap experiment additions ---
