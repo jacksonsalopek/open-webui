@@ -62,6 +62,9 @@ from open_webui.models.knowledge import Knowledges
 
 # Document loaders
 from open_webui.retrieval.loaders.youtube import YoutubeLoader
+from open_webui.retrieval.concepts.integration.router_wiring import (
+    build_concept_graph_extras as _build_concept_graph_extras,
+)
 from open_webui.retrieval.utils import (
     build_loader_from_config,
     filter_accessible_collections,
@@ -2705,8 +2708,7 @@ async def query_doc_handler(
                     else request.app.state.config.HYBRID_BM25_WEIGHT
                 ),
                 concept_graph_store=getattr(request.app.state, 'concept_graph_store', None),
-                concept_graph_embed_fn=None,  # async->sync embedder bridge not yet wired (W3.5 scaffold)
-                concept_graph_reranker=None,
+                **_build_concept_graph_extras(request.app.state),  # W6.10: sync embed_fn + name-only cosine reranker
                 concept_graph_tiebreaker=None,
                 concept_graph_embed_alpha=None,
                 concept_graph_catrag_alpha=None,
@@ -2779,8 +2781,7 @@ async def query_collection_handler(
                     else request.app.state.config.ENABLE_RAG_HYBRID_SEARCH_ENRICHED_TEXTS
                 ),
                 concept_graph_store=getattr(request.app.state, 'concept_graph_store', None),
-                concept_graph_embed_fn=None,  # async->sync embedder bridge not yet wired (W3.5 scaffold)
-                concept_graph_reranker=None,
+                **_build_concept_graph_extras(request.app.state),  # W6.10: sync embed_fn + name-only cosine reranker
                 concept_graph_tiebreaker=None,
                 concept_graph_embed_alpha=None,
                 concept_graph_catrag_alpha=None,

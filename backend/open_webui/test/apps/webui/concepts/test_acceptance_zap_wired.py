@@ -28,9 +28,6 @@ pytest.importorskip(
 # Reuse W3-A's helpers — exported from test_acceptance_lollipop.
 # If W3-A renamed these, follow whatever the actual exported names are
 # and document in the report.
-from open_webui.retrieval.concepts.retrieve.base import RetrievalQuery
-from open_webui.retrieval.concepts.retrieve.router import route
-
 from open_webui.test.apps.webui.concepts.test_acceptance_lollipop import (
     PER_KIND_THRESHOLDS,
     score_documents_against_expected,
@@ -39,9 +36,6 @@ from open_webui.test.apps.webui.concepts.test_acceptance_lollipop import (
     _enable_concept_graph_for_wired_test,
     make_acceptance_reranker,
     _cg_rerank_diagnostic,
-    _catrag_router_config,
-    _catrag_doc_diagnostics,
-    _intent_value,
 )
 
 
@@ -373,29 +367,35 @@ def test_phase2_zap_wired_reranked_acceptance_rate(
     )
 
 
-def _wired_query_with_catrag(
+def _wired_query_v2(
     *,
     store,
     embed_fn,
     question_text: str,
     collection_result,
     k: int = 20,
-    catrag_alpha: float = 0.2,
-    embed_alpha: float = 0.5,
 ) -> list:
-    """Zap wired-path retrieval using the 'catrag' tiebreaker inside route()."""
+    """Run one Zap wired-path retrieval using the default PPR tiebreaker
+    and production-shape BM25 weighting (hybrid_bm25_weight=0.5, matching
+    the RAG_HYBRID_BM25_WEIGHT config default). Returns list[Document].
+
+    Supersedes the W5 catrag wired helper on the Zap corpus after the
+    W6.8 BM25 ablation (scripts/probe_bm25_ablation.py) showed:
+      - catrag's cosine blend costs Zap q03 by 0.40 points vs default PPR
+      - default PPR at bm25=0.5 is the path to wired-PPR matching in-process
+
+    The catrag tiebreaker remains available via RouterConfig(tiebreaker='catrag')
+    for ablation; this helper is the canonical Zap wired-cg gate going forward.
+    """
     import asyncio
-    import os as _os
     from open_webui.retrieval.utils import query_doc_with_hybrid_search
 
     from open_webui.test.apps.webui.concepts.test_acceptance_lollipop import (
         _patch_cg_documents_for_rrf,
         _restore_cg_documents_patch,
+        _stub_vector_search_to_empty,
+        _restore_vector_search,
     )
-
-    catrag_alpha_env = _os.environ.get('CONCEPT_GRAPH_CATRAG_ALPHA')
-    if catrag_alpha_env is not None:
-        catrag_alpha = float(catrag_alpha_env)
 
     async def _embedding_function(text, prefix=None, user=None):
         if isinstance(text, list):
@@ -406,10 +406,11 @@ def _wired_query_with_catrag(
         return [1.0] * len(documents)
 
     patch_original = _patch_cg_documents_for_rrf()
+    vector_original = _stub_vector_search_to_empty()
     try:
         result_dict = asyncio.run(
             query_doc_with_hybrid_search(
-                collection_name='zap-acceptance-wired-catrag',
+                collection_name='zap-acceptance-wired-v2',
                 collection_result=collection_result,
                 query=question_text,
                 embedding_function=_embedding_function,
@@ -417,18 +418,17 @@ def _wired_query_with_catrag(
                 reranking_function=_constant_reranker,
                 k_reranker=k,
                 r=0.0,
-                hybrid_bm25_weight=1.0,
+                hybrid_bm25_weight=0.5,
                 enable_enriched_texts=False,
                 concept_graph_store=store,
                 concept_graph_weight=0.5,
                 concept_graph_embed_fn=embed_fn,
-                concept_graph_tiebreaker='catrag',
-                concept_graph_embed_alpha=embed_alpha,
-                concept_graph_catrag_alpha=catrag_alpha,
+                concept_graph_tiebreaker=None,
             )
         )
     finally:
         _restore_cg_documents_patch(patch_original)
+        _restore_vector_search(vector_original)
 
     from langchain_core.documents import Document
     docs: list[Document] = []
@@ -443,14 +443,19 @@ def _wired_query_with_catrag(
 @pytest.mark.parametrize(
     'q',
     QUESTIONS,
-    ids=lambda q: f"zap-wired-catrag-{q['id']}-{q['intent']}-{q['difficulty']}",
+    ids=lambda q: f"zap-wired-v2-{q['id']}-{q['intent']}-{q['difficulty']}",
 )
-def test_acceptance_question_zap_wired_catrag(
+def test_acceptance_question_zap_wired_v2(
     q,
     zap_subset_store_with_embeddings,
     acceptance_embedder,
 ):
-    """One Zap question, wired-path with catrag tiebreaker inside route()."""
+    """One Zap question, wired-v2 path (default PPR + production-shape BM25).
+
+    W6.9 pivot from wired-catrag: the W6.8 BM25 ablation showed catrag's
+    cosine blend costs Zap q03 vs default PPR. This is now the canonical
+    Zap wired-cg gate.
+    """
     if q['intent'] == 'generate_code':
         pytest.skip('generate_code is out of Phase 1 scope; informational only')
 
@@ -462,7 +467,7 @@ def test_acceptance_question_zap_wired_catrag(
     flag, prior_flag = _enable_concept_graph_for_wired_test()
     try:
         collection_result = _build_synthetic_collection_result('/tmp/zap_subset')
-        docs = _wired_query_with_catrag(
+        docs = _wired_query_v2(
             store=zap_subset_store_with_embeddings,
             embed_fn=embed_fn,
             question_text=q['question'],
@@ -479,36 +484,27 @@ def test_acceptance_question_zap_wired_catrag(
     )
 
     if not passed:
-        router_result = route(
-            RetrievalQuery(text=q['question'], top_k=20),
-            zap_subset_store_with_embeddings,
-            config=_catrag_router_config(embed_fn),
-        )
-        catrag_meta, glossary_matched = _catrag_doc_diagnostics(docs)
         top_names = [
             (d.metadata or {}).get('concept_name')
             or (d.metadata or {}).get('source')
             for d in docs[:10]
         ]
         pytest.fail(
-            f'WIRED-CATRAG Zap question {q["id"]} FAILED.\n'
+            f'WIRED-V2 Zap question {q["id"]} FAILED.\n'
             f'  Intent (expected): {q["intent"]}\n'
-            f'  Intent (classified): {_intent_value(router_result)}\n'
             f'  Score: {score:.2f} (threshold: {threshold})\n'
             f'  Expected: {expected}\n'
             f'  Matched: {sorted(matched)}\n'
             f'  Missed: {sorted(set(expected) - matched)}\n'
-            f'  Top-10 docs (concept_name|source): {top_names}\n'
-            f'  catrag_glossary_matched: {glossary_matched}\n'
-            f'  catrag_metadata (top cg doc): {catrag_meta}'
+            f'  Top-10 docs (concept_name|source): {top_names}'
         )
 
 
-def test_phase2_zap_wired_catrag_acceptance_rate(
+def test_phase2_zap_wired_v2_acceptance_rate(
     zap_subset_store_with_embeddings,
     acceptance_embedder,
 ):
-    """Catrag Zap wired-path floor >= 50% (5/10)."""
+    """Wired-v2 Zap path floor >= 50% (5/10); W6.9 PPR pivot from wired-catrag."""
     embed_fn, embedder_label = acceptance_embedder
     in_scope = [q for q in QUESTIONS if q['intent'] != 'generate_code']
     flag, prior_flag = _enable_concept_graph_for_wired_test()
@@ -520,7 +516,7 @@ def test_phase2_zap_wired_catrag_acceptance_rate(
             expected = q['expected_concepts']
             if not expected:
                 continue
-            docs = _wired_query_with_catrag(
+            docs = _wired_query_v2(
                 store=zap_subset_store_with_embeddings,
                 embed_fn=embed_fn,
                 question_text=q['question'],
@@ -539,15 +535,16 @@ def test_phase2_zap_wired_catrag_acceptance_rate(
 
     pass_rate = passed / len(in_scope) if in_scope else 0.0
     print(
-        f'\nzap-wired-catrag-path acceptance: {passed}/{len(in_scope)} '
+        f'\nzap-wired-v2-path acceptance: {passed}/{len(in_scope)} '
         f'({100 * pass_rate:.0f}%) pass',
     )
     print(f'embedder: {embedder_label}')
     if failures:
-        print('Catrag Zap wired failures:')
+        print('Wired-v2 Zap failures:')
         for f in failures:
             print(f'  {f}')
 
     assert pass_rate >= 0.5, (
-        f'Catrag Zap wired pass rate {pass_rate:.2f} below 0.5 gate (5/10 floor)'
+        f'Wired-v2 Zap pass rate {pass_rate:.2f} below 0.5 gate '
+        f'(5/10 floor; W6.9 PPR pivot)'
     )

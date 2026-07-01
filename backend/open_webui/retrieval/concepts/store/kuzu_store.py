@@ -1575,6 +1575,73 @@ class KuzuGraphStore:
             return self._artifact_row_to_model(row)
         return None
 
+    def _artifact_edge_weight_from_row(
+        self,
+        edge_type: EdgeType,
+        weight_val: object,
+    ) -> float:
+        if weight_val is not None:
+            return float(weight_val)
+        return 1.0
+
+    def list_artifacts_for_concept(
+        self,
+        concept_id: int,
+        *,
+        edge_types: EdgeFilter = (EdgeType.IS_NAMED_IN,),
+        limit: int | None = None,
+    ) -> list[Artifact]:
+        if self.get_concept(concept_id) is None:
+            raise KeyError(concept_id)
+
+        allowed = set(edge_types) if edge_types is not None else {EdgeType.IS_NAMED_IN}
+        artifact_weights: dict[int, float] = {}
+
+        for edge_type in allowed:
+            if edge_type == EdgeType.CO_OCCURS_WITH:
+                continue
+            meta = _EDGE_REL[edge_type]
+            table = meta['table']
+            from_label = meta['from_label']
+            to_label = meta['to_label']
+
+            if from_label == 'Concept' and to_label == 'Artifact':
+                weight_expr = '1.0'
+                query = f"""
+                    MATCH (c:Concept {{id: $concept_id}})-[r:{table}]->(a:Artifact)
+                    RETURN a.id, {weight_expr} AS weight
+                """
+            elif from_label == 'Artifact' and to_label == 'Concept':
+                weight_col = 'r.count' if 'count' in meta['columns'] else '1.0'
+                query = f"""
+                    MATCH (a:Artifact)-[r:{table}]->(c:Concept {{id: $concept_id}})
+                    RETURN a.id, {weight_col} AS weight
+                """
+            else:
+                continue
+
+            result = self._conn.execute(query, {'concept_id': concept_id})
+            for row in result:
+                artifact_id = int(_row_value(row, 0))
+                weight = self._artifact_edge_weight_from_row(
+                    edge_type,
+                    _row_value(row, 1),
+                )
+                existing = artifact_weights.get(artifact_id)
+                if existing is None or weight > existing:
+                    artifact_weights[artifact_id] = weight
+
+        ranked = sorted(artifact_weights.items(), key=lambda item: (-item[1], item[0]))
+        if limit is not None:
+            ranked = ranked[:limit]
+
+        artifacts: list[Artifact] = []
+        for artifact_id, _weight in ranked:
+            artifact = self.get_artifact(artifact_id)
+            if artifact is not None:
+                artifacts.append(artifact)
+        return artifacts
+
     def neighborhood(
         self,
         anchor_id: int,

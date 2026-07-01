@@ -1,5 +1,15 @@
-import pytest
+import os
 from pathlib import Path
+
+import pytest
+
+
+def _embed_mode_from_env() -> str:
+    """Read ``CONCEPT_GRAPH_EMBED_MODE`` for acceptance fixture embedding."""
+    mode = os.environ.get("CONCEPT_GRAPH_EMBED_MODE", "name")
+    if mode in ("name", "name_plus_neighbors"):
+        return mode
+    return "name"
 
 # Phase 1.5 P0-1: documented fixture composition. The acceptance gate's
 # reproducibility depends on this list matching scripts/build_lollipop_fixture.sh
@@ -84,7 +94,11 @@ def lollipop_subset_store_with_embeddings(lollipop_subset_store, acceptance_embe
     """
     from open_webui.test.apps.webui.concepts.embedder import embed_store_concepts
     embed_fn, label = acceptance_embedder
-    count = embed_store_concepts(lollipop_subset_store, embed_fn)
+    count = embed_store_concepts(
+        lollipop_subset_store,
+        embed_fn,
+        enrichment=_embed_mode_from_env(),
+    )
     print(f'\n[acceptance] embedded {count} concepts using {label}')
     return lollipop_subset_store
 
@@ -140,6 +154,10 @@ def zap_subset_store_with_embeddings(zap_subset_store, acceptance_embedder):
     """
     from open_webui.test.apps.webui.concepts.embedder import embed_store_concepts
     embed_fn, label = acceptance_embedder
-    count = embed_store_concepts(zap_subset_store, embed_fn)
+    count = embed_store_concepts(
+        zap_subset_store,
+        embed_fn,
+        enrichment=_embed_mode_from_env(),
+    )
     print(f'\n[acceptance-zap] embedded {count} concepts using {label}')
     return zap_subset_store

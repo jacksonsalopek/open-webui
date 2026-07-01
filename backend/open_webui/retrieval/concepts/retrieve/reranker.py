@@ -148,6 +148,38 @@ def make_cosine_scorer(
     return scorer
 
 
+def make_name_only_cosine_scorer(
+    query_embed_fn: Callable[[str], Sequence[float]],
+) -> ScorerFn:
+    """Return a ScorerFn that cosine-scores hits by re-embedding ``hit.concept.name``.
+
+    Unlike ``make_cosine_scorer`` (which uses ``hit.concept.embedding`` — the
+    pre-computed rich embedding that may include CO_OCCURS_WITH neighbor noise),
+    this scorer re-embeds the concept's bare name on the fly using ``query_embed_fn``.
+    This decouples the reranker's semantic signal from the embedder's enrichment
+    strategy: the reranker always scores against name-only semantics, while the
+    catrag tiebreaker can use the rich embedding (W6.6-C q07 fix).
+
+    Cost: O(K) extra ``query_embed_fn`` calls per ``rerank_hits`` invocation
+    (one per hit). Acceptable for K≤20 in the acceptance harness; production
+    callers with large K should prefer ``make_cosine_scorer`` with pre-computed
+    embeddings.
+
+    Hits with no concept (artifact-only hits) get score ``-inf``.
+    """
+    def scorer(query: str, hits: Sequence[RetrievalHit]) -> list[float]:
+        query_vec = query_embed_fn(query)
+        result: list[float] = []
+        for hit in hits:
+            if hit.concept is None:
+                result.append(float('-inf'))
+                continue
+            concept_vec = query_embed_fn(hit.concept.name)
+            result.append(_cosine_similarity(query_vec, concept_vec))
+        return result
+    return scorer
+
+
 def make_text_scorer(
     cross_encoder_fn: Callable[[str, Sequence[str]], Sequence[float]],
     *,

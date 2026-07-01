@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import time
+from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Any, Awaitable, Optional, Union
 
@@ -457,6 +458,37 @@ async def query_doc_with_hybrid_search(
                         catrag_anchor_alpha=concept_graph_catrag_alpha,
                     )
 
+                    # Phase 2.5 W1 (A1): build a path -> [(text, meta)] index over
+                    # collection_result chunks so the concept-graph adapter's code-chunks
+                    # stream can resolve concept -> IS_NAMED_IN artifact -> chunk text.
+                    _cg_chunk_index: dict[str, list[tuple[str, dict[str, Any]]]] = {}
+                    for _idx, _text in enumerate(original_texts):
+                        _meta = collection_result.metadatas[0][_idx]
+                        _src = _meta.get('source') if isinstance(_meta, Mapping) else None
+                        if isinstance(_src, str) and _src:
+                            _cg_chunk_index.setdefault(_src, []).append((_text, dict(_meta)))
+
+                    def _cg_chunk_lookup(
+                        artifact_path: str,
+                    ) -> 'Sequence[tuple[str, Mapping[str, Any]]]':
+                        # Exact path match first.
+                        hits = _cg_chunk_index.get(artifact_path)
+                        if hits:
+                            return list(hits)
+                        # Normalized fallback (handles trailing-slash / relative-path drift).
+                        ap_norm = os.path.normpath(artifact_path)
+                        for _src, _pairs in _cg_chunk_index.items():
+                            if os.path.normpath(_src) == ap_norm:
+                                return list(_pairs)
+                        # Basename fallback (last resort — handles artifact.path being a
+                        # full path while chunk source is relative, or vice versa).
+                        ap_base = os.path.basename(artifact_path)
+                        if ap_base:
+                            for _src, _pairs in _cg_chunk_index.items():
+                                if os.path.basename(_src) == ap_base:
+                                    return list(_pairs)
+                        return []
+
                     def _cg_retrieve(q: str, n: int):
                         router_result = route(
                             RetrievalQuery(text=q, top_k=n),
@@ -474,10 +506,15 @@ async def query_doc_with_hybrid_search(
                                 )
                         return hits
 
+                    # Widen the CG candidate pool beyond ensemble k so the adapter's
+                    # code_chunks stream can iterate concepts ranked 7–20 by the router.
+                    cg_k = max(k, 20)
                     cg_retriever = ConceptGraphRetriever(
                         router_retrieve=_cg_retrieve,
-                        k=k,
+                        k=cg_k,
                         collection_name=collection_name,
+                        store=concept_graph_store,
+                        chunk_lookup=_cg_chunk_lookup,
                     )
 
                     cg_weight = (
@@ -504,13 +541,14 @@ async def query_doc_with_hybrid_search(
                     log.info(
                         'query_doc_with_hybrid_search: concept_graph member added '
                         '(weight=%.3f, existing=%d retriever(s), embed_fn=%s, '
-                        'reranker=%s, tiebreaker=%s, catrag=%s)',
+                        'reranker=%s, tiebreaker=%s, catrag=%s, chunk_lookup=%s)',
                         cg_weight,
                         len(new_retrievers) - 1,
                         'set' if concept_graph_embed_fn is not None else 'none',
                         'set' if concept_graph_reranker is not None else 'none',
                         concept_graph_tiebreaker or 'default',
                         'set' if concept_graph_catrag_alpha is not None else 'none',
+                        'set' if _cg_chunk_lookup is not None else 'none',
                     )
             except Exception:
                 log.exception(

@@ -234,6 +234,38 @@ class GraphStore(Protocol):
         """
         ...
 
+    def list_artifacts_for_concept(
+        self,
+        concept_id: int,
+        *,
+        edge_types: EdgeFilter = (EdgeType.IS_NAMED_IN,),
+        limit: int | None = None,
+    ) -> Sequence[Artifact]:
+        """Return artifacts connected to ``concept_id`` via the given edge types.
+
+        Answers "which files name/define/reference this concept?" — the
+        key-fact passage enhancement primitive (CatRAG's third mechanism,
+        W5.5) and the embedder's ``name + artifact snippet`` enrichment
+        (W6.6-C).
+
+        ``edge_types`` defaults to ``(IS_NAMED_IN,)`` — the canonical
+        "this concept appears in this artifact" relation. Pass
+        ``(DEFINES, IS_NAMED_IN)`` to also include defining artifacts.
+        ``CO_OCCURS_WITH`` is NOT applicable (it's a concept↔concept edge).
+
+        ``limit`` caps the result count; ``None`` returns all.
+
+        **Determinism contract:** Returns artifacts in a deterministic order:
+        edge weight on the discovering edge descending (within the edge-type
+        set), artifact id ascending (tiebreaker). Two calls with identical
+        arguments against an unchanged store return identical results.
+        Enforced by ``test_store_contract.py`` against both
+        ``InMemoryGraphStore`` and ``KuzuGraphStore``.
+
+        Raises ``KeyError`` if ``concept_id`` is not present in the store.
+        """
+        ...
+
     def neighborhood(
         self,
         anchor_id: int,

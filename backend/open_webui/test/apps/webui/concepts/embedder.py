@@ -23,8 +23,24 @@ import math
 import os
 import re
 from collections.abc import Callable
+from pathlib import Path
+
+from open_webui.retrieval.concepts.schema import Concept, EdgeType
 
 log = logging.getLogger(__name__)
+
+_MAX_EMBEDDING_TEXT_LEN = 400
+
+# W6.5-B excluded CO_OCCURS_WITH to fix q09 reranked; W6.6-C restores it
+# because the reranker now uses name-only embeddings (make_name_only_cosine_scorer),
+# so CO_OCCURS_WITH in concept.embedding only affects the catrag tiebreaker
+# (where it helps q07) and no longer affects the reranker (where it hurt q09).
+_NEIGHBOR_EDGE_TYPES = (
+    EdgeType.CO_OCCURS_WITH,
+    EdgeType.DEFINES,
+    EdgeType.IS_NAMED_IN,
+    EdgeType.REFERENCES,
+)
 
 FAKE_EMBED_DIM = 64
 _TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z0-9]*")
@@ -119,18 +135,118 @@ def get_acceptance_embedder() -> tuple[Callable[[str], tuple[float, ...]], str]:
     return fake_embedder(), "fake"
 
 
+def _build_concept_embedding_text(
+    concept: Concept,
+    store,
+    *,
+    enrichment: str = "name",
+    max_neighbors: int = 10,
+) -> str:
+    """Build the text passed to ``embed_fn`` for a single concept."""
+    if enrichment == "name":
+        return concept.name
+
+    if enrichment == "name_plus_artifact_snippet":
+        list_artifacts = getattr(store, "list_artifacts_for_concept", None)
+        if list_artifacts is None:
+            return concept.name
+
+        try:
+            artifacts = list_artifacts(
+                concept.id,
+                edge_types=(EdgeType.IS_NAMED_IN,),
+                limit=3,
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning(
+                "list_artifacts_for_concept failed for concept %s (%d): %s",
+                concept.name,
+                concept.id,
+                e,
+            )
+            return concept.name
+
+        if not artifacts:
+            return concept.name
+
+        base = concept.name
+        if concept.definition is not None:
+            base = f"{concept.name}: {concept.definition}"
+
+        basenames = [Path(artifact.path).name for artifact in artifacts]
+        text = base + " " + " ".join(basenames)
+        if len(text) > _MAX_EMBEDDING_TEXT_LEN:
+            text = text[: _MAX_EMBEDDING_TEXT_LEN - 1] + "…"
+        return text
+
+    if enrichment != "name_plus_neighbors":
+        raise ValueError(f"unsupported enrichment mode: {enrichment!r}")
+
+    try:
+        neighbors = store.neighborhood(
+            concept.id,
+            radius=1,
+            edge_types=_NEIGHBOR_EDGE_TYPES,
+            limit=max_neighbors,
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning(
+            "neighborhood lookup failed for concept %s (%d): %s",
+            concept.name,
+            concept.id,
+            e,
+        )
+        return concept.name
+
+    if not neighbors:
+        log.debug(
+            "empty neighborhood for concept %s (%d); falling back to name only",
+            concept.name,
+            concept.id,
+        )
+        return concept.name
+
+    base = concept.name
+    if concept.definition is not None:
+        base = f"{concept.name}: {concept.definition}"
+
+    neighbor_names = [n.name for n in neighbors if n.name != concept.name]
+    if not neighbor_names:
+        return base
+
+    text = base + " " + " ".join(neighbor_names)
+    if len(text) > _MAX_EMBEDDING_TEXT_LEN:
+        text = text[: _MAX_EMBEDDING_TEXT_LEN - 1] + "…"
+    return text
+
+
 def embed_store_concepts(
     store,
     embed_fn: Callable[[str], tuple[float, ...]],
     *,
     overwrite: bool = False,
+    enrichment: str = "name",
 ) -> int:
     """Populate ``concept.embedding`` for every concept in ``store``.
 
     Uses ``store.list_concepts()`` to iterate and ``set_concept_embedding()``
-    to write each vector. Embeds ``concept.name`` (deliberately NOT ``snippet``
-    or other fields — name is the canonical token for the concept and matches
-    what queries embed).
+    to write each vector.
+
+    ``enrichment`` controls the text embedded for each concept:
+
+    - ``"name"`` (default): embed ``concept.name`` only. Fast and matches the
+      query-embeds-a-bare-token shape used by the acceptance harness.
+    - ``"name_plus_neighbors"``: embed ``concept.name`` plus up to 10
+      1-hop neighbor names (via ``store.neighborhood`` with DEFINES,
+      IS_NAMED_IN, REFERENCES, and CO_OCCURS_WITH). Slower — O(N)
+      neighborhood calls — but gives the sentence embedder neighborhood
+      context so semantic similarity captures e.g. "command is near
+      palette/filter/item" and co-occurrence neighbors like ``mutex``.
+    - ``"name_plus_artifact_snippet"``: embed ``concept.name`` plus up to
+      3 IS_NAMED_IN artifact path basenames (via ``store.list_artifacts_for_concept``).
+      Falls back to name-only when the method is absent or returns no artifacts.
+      Gives provenance context (e.g. ``webp VipsImageProcessor.cs``) for
+      vocabulary-mismatch queries.
 
     Skips concepts that already have a non-None embedding unless
     ``overwrite=True``.
@@ -141,7 +257,8 @@ def embed_store_concepts(
     for concept in store.list_concepts():
         if concept.embedding is not None and not overwrite:
             continue
-        new_embedding = embed_fn(concept.name)
+        text = _build_concept_embedding_text(concept, store, enrichment=enrichment)
+        new_embedding = embed_fn(text)
         store.set_concept_embedding(concept.id, new_embedding)
         count += 1
     return count

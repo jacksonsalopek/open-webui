@@ -373,6 +373,45 @@ class InMemoryGraphStore:
     def get_artifact(self, artifact_id: int) -> Artifact | None:
         return self._artifacts.get(artifact_id)
 
+    def list_artifacts_for_concept(
+        self,
+        concept_id: int,
+        *,
+        edge_types: EdgeFilter = (EdgeType.IS_NAMED_IN,),
+        limit: int | None = None,
+    ) -> list[Artifact]:
+        if concept_id not in self._concepts:
+            raise KeyError(concept_id)
+
+        allowed = set(edge_types) if edge_types is not None else {EdgeType.IS_NAMED_IN}
+        artifact_weights: dict[int, float] = {}
+
+        for edge in self._edges.values():
+            if edge.type not in allowed:
+                continue
+            artifact_id: int | None = None
+            if edge.src_id == concept_id and edge.dst_id in self._artifacts:
+                artifact_id = edge.dst_id
+            elif edge.dst_id == concept_id and edge.src_id in self._artifacts:
+                artifact_id = edge.src_id
+            if artifact_id is None:
+                continue
+            weight = self._edge_weight_from_properties(edge.properties)
+            existing = artifact_weights.get(artifact_id)
+            if existing is None or weight > existing:
+                artifact_weights[artifact_id] = weight
+
+        ranked = sorted(artifact_weights.items(), key=lambda item: (-item[1], item[0]))
+        if limit is not None:
+            ranked = ranked[:limit]
+
+        result: list[Artifact] = []
+        for artifact_id, _weight in ranked:
+            artifact = self.get_artifact(artifact_id)
+            if artifact is not None:
+                result.append(artifact)
+        return result
+
     def _normalize_edge_types(self, edge_types: EdgeFilter) -> set[EdgeType]:
         if edge_types is None:
             return {EdgeType.CO_OCCURS_WITH}
@@ -387,9 +426,15 @@ class InMemoryGraphStore:
         edge = self._edges.get((edge_type, src_id, dst_id))
         if edge is None:
             return 1.0
-        weight = edge.properties.get('weight')
+        return self._edge_weight_from_properties(edge.properties)
+
+    def _edge_weight_from_properties(self, properties: Mapping[str, object]) -> float:
+        weight = properties.get('weight')
         if weight is not None:
             return float(weight)
+        count = properties.get('count')
+        if count is not None:
+            return float(count)
         return 1.0
 
     def _neighbors(

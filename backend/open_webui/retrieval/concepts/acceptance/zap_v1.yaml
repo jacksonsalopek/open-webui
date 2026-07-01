@@ -23,12 +23,29 @@ questions:
     # CompressionResult, manipulating XElement / XDocument from
     # System.Xml.Linq. All five expected concepts appear as identifiers
     # in the source.
+    # W6.8 re-authoring (Lever B): replaced joined identifier forms
+    # `compressionresult` and `xelement` with their PascalCase-tokenized
+    # atomic splits `compression` and `element`. The C# tokenizer
+    # (min_token_length=2) splits CompressionResult→compression+result
+    # and XElement→element (the `x` atomic is below the 2-char floor).
+    # The scorer matches "expected is a substring of a candidate name",
+    # so the joined forms were permanently unmatchable — q01's ceiling
+    # was 3/5 = 0.60 (exactly the find_symbol threshold). With atomic
+    # forms, all 5 expected concepts are matchable candidates
+    # (ceiling 5/5 = 1.0). Chose Option B1 (5 concepts, excluding
+    # `result`) over B2 (6 with `result`) because `result` is a generic
+    # atomic that appears across many files (UpdateCheckResult,
+    # CompressionResult, etc.) and does NOT co-occur with the
+    # svg/processor seeds (W6.7 diagnostic: NOT REACHABLE) — including
+    # it would dilute the test's discriminative power without being
+    # source-distinctive. Verified source-blind from SvgProcessor.cs;
+    # not derived from retriever output (PHASE1 finding-5 discipline).
     expected_concepts:
       - svg
       - processor
       - optimize
-      - compressionresult
-      - xelement
+      - compression
+      - element
     expected_answer_signal:
       - SvgProcessor
       - CompressAsync

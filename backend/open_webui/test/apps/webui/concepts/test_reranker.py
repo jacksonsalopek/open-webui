@@ -10,6 +10,7 @@ import pytest
 from open_webui.retrieval.concepts.retrieve.base import RetrievalHit
 from open_webui.retrieval.concepts.retrieve.reranker import (
     make_cosine_scorer,
+    make_name_only_cosine_scorer,
     make_text_scorer,
     rerank_hits,
 )
@@ -261,3 +262,81 @@ def test_make_text_scorer_default_text_fn_for_artifact() -> None:
     scorer('q', hits)
 
     assert captured == [['/docs/readme.md']]
+
+
+def _cosine(a: Sequence[float], b: Sequence[float]) -> float:
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(x * x for x in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        return 0.0
+    return dot / (norm_a * norm_b)
+
+
+def test_make_name_only_cosine_scorer_re_embeds_concept_names() -> None:
+    hits = [
+        _hit('toolbar', concept_id=1, embedding=None),
+        _hit('clipboard', concept_id=2, embedding=None),
+    ]
+    embed_calls: list[str] = []
+
+    def query_embed_fn(text: str) -> tuple[float, ...]:
+        embed_calls.append(text)
+        if text == 'query':
+            return (1.0, 0.0)
+        if text == 'toolbar':
+            return (0.9, 0.1)
+        if text == 'clipboard':
+            return (0.1, 0.9)
+        return (0.0, 0.0)
+
+    scorer = make_name_only_cosine_scorer(query_embed_fn=query_embed_fn)
+    scores = scorer('query', hits)
+
+    assert embed_calls == ['query', 'toolbar', 'clipboard']
+    assert scores[0] == pytest.approx(_cosine((1.0, 0.0), (0.9, 0.1)))
+    assert scores[1] == pytest.approx(_cosine((1.0, 0.0), (0.1, 0.9)))
+
+
+def test_make_name_only_cosine_scorer_artifact_hits_get_neg_inf() -> None:
+    hits = [_artifact_hit(path='/src/bar.cs')]
+    scorer = make_name_only_cosine_scorer(query_embed_fn=lambda _q: (1.0, 0.0))
+
+    assert scorer('q', hits)[0] == float('-inf')
+
+
+def test_make_name_only_cosine_scorer_deterministic() -> None:
+    hits = [
+        _hit('alpha', concept_id=1, embedding=None),
+        _hit('beta', concept_id=2, embedding=None),
+    ]
+
+    def query_embed_fn(text: str) -> tuple[float, ...]:
+        return (float(len(text)), 0.0)
+
+    scorer = make_name_only_cosine_scorer(query_embed_fn=query_embed_fn)
+    first = scorer('query', hits)
+    second = scorer('query', hits)
+
+    assert first == second
+
+
+def test_make_name_only_cosine_scorer_differs_from_make_cosine_scorer_when_embedding_is_rich() -> None:
+    rich_embedding = (0.0, 1.0)
+    name_embedding = (1.0, 0.0)
+    hits = [_hit('alpha', embedding=rich_embedding)]
+
+    def query_embed_fn(text: str) -> tuple[float, ...]:
+        if text == 'alpha':
+            return name_embedding
+        return (1.0, 0.0)
+
+    name_only_scorer = make_name_only_cosine_scorer(query_embed_fn=query_embed_fn)
+    cosine_scorer = make_cosine_scorer(query_embed_fn=query_embed_fn)
+
+    name_only_score = name_only_scorer('query', hits)[0]
+    cosine_score = cosine_scorer('query', hits)[0]
+
+    assert name_only_score == pytest.approx(_cosine((1.0, 0.0), name_embedding))
+    assert cosine_score == pytest.approx(_cosine((1.0, 0.0), rich_embedding))
+    assert name_only_score != cosine_score

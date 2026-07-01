@@ -137,13 +137,50 @@ def _router_config(embed_fn) -> RouterConfig:
     embed_blend_alpha = float(alpha_env) if alpha_env else None
     catrag_alpha_env = _os.environ.get('CONCEPT_GRAPH_CATRAG_ALPHA')
     catrag_anchor_alpha = float(catrag_alpha_env) if catrag_alpha_env else None
-    return RouterConfig(
+
+    # W6.6-A: opt-in widened find_symbol edge_types + radius.
+    # CONCEPT_GRAPH_FIND_SYMBOL_EDGE_TYPES=co_occurs → (DEFINES, IS_NAMED_IN, CO_OCCURS_WITH)
+    # CONCEPT_GRAPH_FIND_SYMBOL_RADIUS=2 → radius-2 walk (W6-B opt-in ablation)
+    from open_webui.retrieval.concepts.schema import EdgeType as _EdgeType
+    find_symbol_edge_types_env = _os.environ.get('CONCEPT_GRAPH_FIND_SYMBOL_EDGE_TYPES')
+    find_symbol_edge_types = None
+    if find_symbol_edge_types_env == 'co_occurs':
+        find_symbol_edge_types = (
+            _EdgeType.DEFINES,
+            _EdgeType.IS_NAMED_IN,
+            _EdgeType.CO_OCCURS_WITH,
+        )
+    find_symbol_radius_env = _os.environ.get('CONCEPT_GRAPH_FIND_SYMBOL_RADIUS')
+    find_symbol_radius = int(find_symbol_radius_env) if find_symbol_radius_env else None
+
+    # W6.8 Lever A: query-side CODE-stopword relaxation. Default True
+    # (keep ``instance``/``args``/``kwargs``-class tokens as seeds when
+    # they pass the identifier-shape check). Set
+    # CONCEPT_GRAPH_KEEP_CODE_SYMBOLS=0|false|no to ablate (W6.6 behavior).
+    keep_code_env = _os.environ.get('CONCEPT_GRAPH_KEEP_CODE_SYMBOLS')
+    keep_code_symbols_as_seeds = True
+    if keep_code_env is not None and keep_code_env.strip() != '':
+        keep_code_symbols_as_seeds = keep_code_env.strip().lower() in (
+            '1',
+            'true',
+            'yes',
+            'on',
+        )
+
+    kwargs: dict = dict(
         language='csharp',
         embed_fn=embed_fn,
         tiebreaker=tiebreaker,
         embed_blend_alpha=embed_blend_alpha,
         catrag_anchor_alpha=catrag_anchor_alpha,
+        find_symbol_edge_types=find_symbol_edge_types,
+        keep_code_symbols_as_seeds=keep_code_symbols_as_seeds,
     )
+    # Only override find_symbol_radius when explicitly set; the RouterConfig
+    # default is 1, and passing None would crash the find_symbol walk.
+    if find_symbol_radius is not None:
+        kwargs['find_symbol_radius'] = find_symbol_radius
+    return RouterConfig(**kwargs)
 
 
 def score_documents_against_expected(
@@ -394,6 +431,29 @@ def _restore_cg_documents_patch(original):
     retriever_adapter._hit_to_document = original
 
 
+def _stub_vector_search_to_empty():
+    """Replace VectorSearchRetriever._aget_relevant_documents with a no-op
+    so a hybrid_bm25_weight in (0, 1) doesn't crash on the missing test-env
+    vector DB collection. Mirrors scripts/probe_bm25_ablation.py's stub —
+    the wired-v2 helpers need this when bm25=0.5 engages the vector path.
+
+    Returns the original fn for restoration via _restore_vector_search."""
+    from open_webui.retrieval import utils as _utils
+
+    original = _utils.VectorSearchRetriever._aget_relevant_documents
+
+    async def _empty(self, query, *, run_manager):
+        return []
+
+    _utils.VectorSearchRetriever._aget_relevant_documents = _empty
+    return original
+
+
+def _restore_vector_search(original):
+    from open_webui.retrieval import utils as _utils
+    _utils.VectorSearchRetriever._aget_relevant_documents = original
+
+
 def _wired_query(
     *,
     store,
@@ -565,19 +625,20 @@ def test_phase2_wired_acceptance_rate(
 
 
 def make_acceptance_reranker(embed_fn):
-    """Build the cosine-based pre-RRF reranker for wired acceptance tests.
+    """Build the name-only cosine pre-RRF reranker for wired acceptance tests.
 
-    Uses the acceptance embedder (deterministic) so the test is reproducible.
-    No network, no model download. Wraps W4-A's ``make_cosine_scorer`` +
-    ``rerank_hits`` so the closure has the (query, hits) -> hits shape that
-    ``query_doc_with_hybrid_search``'s ``concept_graph_reranker`` param accepts.
+    Uses ``make_name_only_cosine_scorer`` (W6.6-C) so the reranker scores
+    against ``concept.name`` semantics, decoupled from the embedder's
+    enrichment strategy. This preserves q09 reranked (which regressed when
+    the reranker used CO_OCCURS_WITH-rich embeddings) while allowing catrag
+    to use rich embeddings (which helps q07).
     """
     from open_webui.retrieval.concepts.retrieve.reranker import (
-        make_cosine_scorer,
+        make_name_only_cosine_scorer,
         rerank_hits,
     )
 
-    scorer = make_cosine_scorer(query_embed_fn=embed_fn)
+    scorer = make_name_only_cosine_scorer(query_embed_fn=embed_fn)
 
     def _reranker(query, hits):
         return rerank_hits(query, hits, scorer=scorer)
@@ -802,19 +863,17 @@ def test_phase2_wired_reranked_acceptance_rate(
     )
 
 
-def _catrag_router_config(embed_fn, *, catrag_alpha=0.2, embed_alpha=0.5) -> RouterConfig:
-    """RouterConfig pinned to catrag tiebreaker for failure diagnostics."""
-    import os as _os
+def _wired_v2_router_config(embed_fn) -> RouterConfig:
+    """RouterConfig for the wired-v2 acceptance harness.
 
-    catrag_alpha_env = _os.environ.get('CONCEPT_GRAPH_CATRAG_ALPHA')
-    if catrag_alpha_env is not None:
-        catrag_alpha = float(catrag_alpha_env)
+    W6.9 pivot: default PPR tiebreaker (no catrag cosine blend) — the
+    W6.8 BM25 ablation (scripts/probe_bm25_ablation.py) showed catrag's
+    cosine leg costs Zap q03 by 0.40 points vs default PPR.
+    """
     return RouterConfig(
         language='csharp',
         embed_fn=embed_fn,
-        tiebreaker='catrag',
-        embed_blend_alpha=embed_alpha,
-        catrag_anchor_alpha=catrag_alpha,
+        tiebreaker=None,
     )
 
 
@@ -835,32 +894,28 @@ def _catrag_doc_diagnostics(docs: list) -> tuple[dict | None, bool]:
     return catrag_meta, glossary_matched
 
 
-def _wired_query_with_catrag(
+def _wired_query_v2(
     *,
     store,
     embed_fn,
     question_text: str,
     collection_result,
     k: int = 20,
-    catrag_alpha: float = 0.2,
-    embed_alpha: float = 0.5,
 ) -> list:
-    """Wired-path retrieval using the 'catrag' tiebreaker inside the cg-router.
+    """Run one wired-path retrieval using the default PPR tiebreaker and
+    production-shape BM25 weighting (hybrid_bm25_weight=0.5, matching the
+    RAG_HYBRID_BM25_WEIGHT config default). Returns list[Document].
 
-    Unlike _wired_query_with_reranker which post-processes hits with a
-    cosine reranker AFTER route() returns, this variant configures route()
-    itself to use the catrag tiebreaker — combining PPR + cosine + glossary
-    anchor bonus inside the neighborhood retriever's _sort_key. The hit
-    ordering coming OUT of route() is already query-aware; no separate
-    reranker call.
+    Supersedes the W5 catrag wired helper after the W6.8 BM25 ablation
+    (scripts/probe_bm25_ablation.py) showed:
+      - catrag's cosine blend costs Zap q03 by 0.40 points vs default PPR
+      - default PPR at bm25=0.5 is the path to wired-PPR matching in-process
+
+    The catrag tiebreaker remains available via RouterConfig(tiebreaker='catrag')
+    for ablation; this helper is the canonical wired-cg gate going forward.
     """
     import asyncio
-    import os as _os
     from open_webui.retrieval.utils import query_doc_with_hybrid_search
-
-    catrag_alpha_env = _os.environ.get('CONCEPT_GRAPH_CATRAG_ALPHA')
-    if catrag_alpha_env is not None:
-        catrag_alpha = float(catrag_alpha_env)
 
     async def _embedding_function(text, prefix=None, user=None):
         if isinstance(text, list):
@@ -871,10 +926,11 @@ def _wired_query_with_catrag(
         return [1.0] * len(documents)
 
     patch_original = _patch_cg_documents_for_rrf()
+    vector_original = _stub_vector_search_to_empty()
     try:
         result_dict = asyncio.run(
             query_doc_with_hybrid_search(
-                collection_name='lollipop-acceptance-wired-catrag',
+                collection_name='lollipop-acceptance-wired-v2',
                 collection_result=collection_result,
                 query=question_text,
                 embedding_function=_embedding_function,
@@ -882,18 +938,17 @@ def _wired_query_with_catrag(
                 reranking_function=_constant_reranker,
                 k_reranker=k,
                 r=0.0,
-                hybrid_bm25_weight=1.0,
+                hybrid_bm25_weight=0.5,
                 enable_enriched_texts=False,
                 concept_graph_store=store,
                 concept_graph_weight=0.5,
                 concept_graph_embed_fn=embed_fn,
-                concept_graph_tiebreaker='catrag',
-                concept_graph_embed_alpha=embed_alpha,
-                concept_graph_catrag_alpha=catrag_alpha,
+                concept_graph_tiebreaker=None,
             )
         )
     finally:
         _restore_cg_documents_patch(patch_original)
+        _restore_vector_search(vector_original)
 
     from langchain_core.documents import Document
     docs: list[Document] = []
@@ -908,14 +963,19 @@ def _wired_query_with_catrag(
 @pytest.mark.parametrize(
     'q',
     QUESTIONS,
-    ids=lambda q: f"wired-catrag-{q['id']}-{q['intent']}-{q['difficulty']}",
+    ids=lambda q: f"wired-v2-{q['id']}-{q['intent']}-{q['difficulty']}",
 )
-def test_acceptance_question_wired_catrag_path(
+def test_acceptance_question_wired_v2_path(
     q,
     lollipop_subset_store_with_embeddings,
     acceptance_embedder,
 ):
-    """Wired-path variant using the catrag tiebreaker INSIDE route()."""
+    """Wired-path variant using default PPR tiebreaker + production-shape BM25.
+
+    W6.9 pivot from wired-catrag: the W6.8 BM25 ablation showed catrag's
+    cosine blend costs Zap q03 vs default PPR, and default-PPR wired at
+    bm25=0.5 (production default) is the canonical wired-cg gate.
+    """
     if q['intent'] == 'generate_code':
         pytest.skip('generate_code is out of Phase 1 scope; informational only')
 
@@ -927,7 +987,7 @@ def test_acceptance_question_wired_catrag_path(
     flag, prior_flag = _enable_concept_graph_for_wired_test()
     try:
         collection_result = _build_synthetic_collection_result('/tmp/lollipop_subset')
-        docs = _wired_query_with_catrag(
+        docs = _wired_query_v2(
             store=lollipop_subset_store_with_embeddings,
             embed_fn=embed_fn,
             question_text=q['question'],
@@ -944,36 +1004,27 @@ def test_acceptance_question_wired_catrag_path(
     )
 
     if not passed:
-        router_result = route(
-            RetrievalQuery(text=q['question'], top_k=20),
-            lollipop_subset_store_with_embeddings,
-            config=_catrag_router_config(embed_fn),
-        )
-        catrag_meta, glossary_matched = _catrag_doc_diagnostics(docs)
         top_names = [
             (d.metadata or {}).get('concept_name')
             or (d.metadata or {}).get('source')
             for d in docs[:10]
         ]
         pytest.fail(
-            f'WIRED-CATRAG question {q["id"]} FAILED.\n'
+            f'WIRED-V2 question {q["id"]} FAILED.\n'
             f'  Intent (expected): {q["intent"]}\n'
-            f'  Intent (classified): {_intent_value(router_result)}\n'
             f'  Score: {score:.2f} (threshold: {threshold})\n'
             f'  Expected: {expected}\n'
             f'  Matched: {sorted(matched)}\n'
             f'  Missed: {sorted(set(expected) - matched)}\n'
-            f'  Top-10 docs (concept_name|source): {top_names}\n'
-            f'  catrag_glossary_matched: {glossary_matched}\n'
-            f'  catrag_metadata (top cg doc): {catrag_meta}'
+            f'  Top-10 docs (concept_name|source): {top_names}'
         )
 
 
-def test_phase2_wired_catrag_acceptance_rate(
+def test_phase2_wired_v2_acceptance_rate(
     lollipop_subset_store_with_embeddings,
     acceptance_embedder,
 ):
-    """Catrag wired-path floor >= 60% (6/9); measures lift vs bare wired."""
+    """Wired-v2 path floor >= 66% (6/9); W6.9 PPR pivot from wired-catrag."""
     embed_fn, embedder_label = acceptance_embedder
     in_scope = [q for q in QUESTIONS if q['intent'] != 'generate_code']
     flag, prior_flag = _enable_concept_graph_for_wired_test()
@@ -985,7 +1036,7 @@ def test_phase2_wired_catrag_acceptance_rate(
             expected = q['expected_concepts']
             if not expected:
                 continue
-            docs = _wired_query_with_catrag(
+            docs = _wired_query_v2(
                 store=lollipop_subset_store_with_embeddings,
                 embed_fn=embed_fn,
                 question_text=q['question'],
@@ -1004,15 +1055,16 @@ def test_phase2_wired_catrag_acceptance_rate(
 
     pass_rate = passed / len(in_scope) if in_scope else 0.0
     print(
-        f'\nwired-catrag-path acceptance: {passed}/{len(in_scope)} '
+        f'\nwired-v2-path acceptance: {passed}/{len(in_scope)} '
         f'({100 * pass_rate:.0f}%) pass',
     )
     print(f'embedder: {embedder_label}')
     if failures:
-        print('Catrag wired failures:')
+        print('Wired-v2 failures:')
         for f in failures:
             print(f'  {f}')
 
     assert pass_rate >= 0.66, (
-        f'Catrag wired pass rate {pass_rate:.2f} below 0.66 gate (6/9 floor)'
+        f'Wired-v2 pass rate {pass_rate:.2f} below 0.66 gate '
+        f'(6/9 floor; W6.9 PPR pivot)'
     )

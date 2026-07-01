@@ -19,6 +19,7 @@ from open_webui.retrieval.concepts.schema import (
     CoOccursWithProps,
     DefinesProps,
     EdgeType,
+    IsNamedInProps,
     ReferencesProps,
     edge_with_props,
 )
@@ -111,9 +112,47 @@ def _link(
             dst_id=dst_id,
             props=IsCanonicalAliasOfProps(introduced_at=_TS),
         )
+    elif edge_type == EdgeType.IS_NAMED_IN:
+        edge = edge_with_props(
+            src_id=src_id,
+            dst_id=dst_id,
+            props=IsNamedInProps(first_seen_at=props.get('first_seen_at', _TS)),
+        )
     else:
         raise ValueError(f'unsupported edge type in test helper: {edge_type!r}')
     store.upsert_edge(edge)
+
+
+def _link_concept_artifact(
+    store: GraphStore,
+    concept_id: int,
+    artifact_id: int,
+    edge_type: EdgeType,
+    **props: object,
+) -> None:
+    if edge_type == EdgeType.IS_NAMED_IN:
+        _link(store, concept_id, artifact_id, edge_type=EdgeType.IS_NAMED_IN, **props)
+    elif edge_type == EdgeType.DEFINES:
+        store.upsert_edge(
+            edge_with_props(
+                src_id=artifact_id,
+                dst_id=concept_id,
+                props=DefinesProps(count=int(props.get('count', 1))),
+            ),
+        )
+    elif edge_type == EdgeType.REFERENCES:
+        store.upsert_edge(
+            edge_with_props(
+                src_id=artifact_id,
+                dst_id=concept_id,
+                props=ReferencesProps(
+                    count=int(props.get('count', 1)),
+                    positions=props.get('positions'),  # type: ignore[arg-type]
+                ),
+            ),
+        )
+    else:
+        raise ValueError(f'unsupported concept-artifact edge type: {edge_type!r}')
 
 
 def _co_occurs_props(
@@ -1067,3 +1106,135 @@ def test_set_concept_embedding_reflected_in_vector_search(
         assert a_id < after[1][0].id
     else:
         assert after[0][0].id != a_id
+
+
+def test_list_artifacts_for_concept_returns_is_named_in_artifacts(
+    store_impl: GraphStore,
+) -> None:
+    concept_id = _upsert(store_impl, _concept('named-in-target'))
+    artifact_a = store_impl.upsert_artifact(_artifact('/src/Alpha.cs', chunk_index=0))
+    artifact_b = store_impl.upsert_artifact(_artifact('/src/Beta.cs', chunk_index=1))
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        artifact_a,
+        edge_type=EdgeType.IS_NAMED_IN,
+    )
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        artifact_b,
+        edge_type=EdgeType.IS_NAMED_IN,
+    )
+
+    artifacts = store_impl.list_artifacts_for_concept(concept_id)
+    assert {a.id for a in artifacts} == {artifact_a, artifact_b}
+
+
+def test_list_artifacts_for_concept_deterministic_order(
+    store_impl: GraphStore,
+) -> None:
+    concept_id = _upsert(store_impl, _concept('order-target'))
+    low = store_impl.upsert_artifact(_artifact('/src/low.cs', chunk_index=0))
+    mid = store_impl.upsert_artifact(_artifact('/src/mid.cs', chunk_index=1))
+    high = store_impl.upsert_artifact(_artifact('/src/high.cs', chunk_index=2))
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        low,
+        edge_type=EdgeType.DEFINES,
+        count=1,
+    )
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        mid,
+        edge_type=EdgeType.DEFINES,
+        count=3,
+    )
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        high,
+        edge_type=EdgeType.DEFINES,
+        count=5,
+    )
+
+    first = store_impl.list_artifacts_for_concept(
+        concept_id,
+        edge_types=(EdgeType.DEFINES,),
+    )
+    second = store_impl.list_artifacts_for_concept(
+        concept_id,
+        edge_types=(EdgeType.DEFINES,),
+    )
+    assert first == second
+    assert [a.id for a in first] == [high, mid, low]
+
+
+def test_list_artifacts_for_concept_limit(store_impl: GraphStore) -> None:
+    concept_id = _upsert(store_impl, _concept('limit-target'))
+    artifact_ids: list[int] = []
+    for i in range(5):
+        artifact_id = store_impl.upsert_artifact(
+            _artifact(f'/src/limit{i}.cs', chunk_index=i),
+        )
+        artifact_ids.append(artifact_id)
+        _link_concept_artifact(
+            store_impl,
+            concept_id,
+            artifact_id,
+            edge_type=EdgeType.IS_NAMED_IN,
+        )
+
+    artifacts = store_impl.list_artifacts_for_concept(concept_id, limit=3)
+    assert len(artifacts) == 3
+
+
+def test_list_artifacts_for_concept_edge_types_filter(
+    store_impl: GraphStore,
+) -> None:
+    concept_id = _upsert(store_impl, _concept('filter-target'))
+    named_in_artifact = store_impl.upsert_artifact(
+        _artifact('/src/named.cs', chunk_index=0),
+    )
+    defines_artifact = store_impl.upsert_artifact(
+        _artifact('/src/defines.cs', chunk_index=1),
+    )
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        named_in_artifact,
+        edge_type=EdgeType.IS_NAMED_IN,
+    )
+    _link_concept_artifact(
+        store_impl,
+        concept_id,
+        defines_artifact,
+        edge_type=EdgeType.DEFINES,
+    )
+
+    named_only = store_impl.list_artifacts_for_concept(
+        concept_id,
+        edge_types=(EdgeType.IS_NAMED_IN,),
+    )
+    both = store_impl.list_artifacts_for_concept(
+        concept_id,
+        edge_types=(EdgeType.DEFINES, EdgeType.IS_NAMED_IN),
+    )
+    assert {a.id for a in named_only} == {named_in_artifact}
+    assert {a.id for a in both} == {named_in_artifact, defines_artifact}
+
+
+def test_list_artifacts_for_concept_raises_on_unknown_concept_id(
+    store_impl: GraphStore,
+) -> None:
+    with pytest.raises(KeyError):
+        store_impl.list_artifacts_for_concept(999_999)
+
+
+def test_list_artifacts_for_concept_empty_when_no_edges(
+    store_impl: GraphStore,
+) -> None:
+    concept_id = _upsert(store_impl, _concept('lonely'))
+    assert store_impl.list_artifacts_for_concept(concept_id) == []

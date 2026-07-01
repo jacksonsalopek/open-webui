@@ -491,6 +491,172 @@ def test_concept_graph_tiebreaker_threads_through(hybrid_patches) -> None:
         CONCEPT_GRAPH_ENABLED.value = orig
 
 
+def _capture_cgr_kwargs():
+    captured: list[dict] = []
+
+    def _capture(**kwargs):
+        captured.append(kwargs)
+        return MagicMock()
+
+    return _capture, captured
+
+
+def test_concept_graph_retriever_receives_chunk_lookup(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(concept_graph_store=MagicMock())
+
+        assert captured[0]['store'] is not None
+        assert callable(captured[0]['chunk_lookup'])
+        result = captured[0]['chunk_lookup']('a.cs')
+        assert len(result) == 1
+        assert result[0][0] == 'doc1 text'
+        assert result[0][1]['source'] == 'a.cs'
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
+def test_chunk_lookup_resolves_by_basename_fallback(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    custom_result = SimpleNamespace(
+        documents=[['chunk text']],
+        metadatas=[[{'source': '/abs/path/to/a.cs'}]],
+    )
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(
+                concept_graph_store=MagicMock(),
+                collection_result=custom_result,
+            )
+
+        result = captured[0]['chunk_lookup']('a.cs')
+        assert len(result) == 1
+        assert result[0][0] == 'chunk text'
+        assert result[0][1]['source'] == '/abs/path/to/a.cs'
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
+def test_chunk_lookup_returns_empty_for_no_match(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(concept_graph_store=MagicMock())
+
+        assert captured[0]['chunk_lookup']('nonexistent.cs') == []
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
+def test_chunk_lookup_index_built_from_collection_result_chunks(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    custom_result = SimpleNamespace(
+        documents=[['t1', 't2', 't3']],
+        metadatas=[[{'source': 'src1.cs'}, {'source': 'src1.cs'}, {'source': 'src2.cs'}]],
+    )
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(
+                concept_graph_store=MagicMock(),
+                collection_result=custom_result,
+            )
+
+        chunk_lookup = captured[0]['chunk_lookup']
+        assert len(chunk_lookup('src1.cs')) == 2
+        assert len(chunk_lookup('src2.cs')) == 1
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
+def test_cg_retriever_k_floored_to_20(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(concept_graph_store=MagicMock(), k=4)
+
+        assert captured[0]['k'] == 20
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
+def test_cg_retriever_k_unchanged_when_above_floor(hybrid_patches) -> None:
+    orig = CONCEPT_GRAPH_ENABLED.value
+    CONCEPT_GRAPH_ENABLED.value = True
+    _capture, captured = _capture_cgr_kwargs()
+    try:
+        with (
+            patch(
+                'open_webui.retrieval.concepts.retrieve.router.route',
+                return_value=_empty_router_result(),
+            ),
+            patch(
+                'open_webui.retrieval.concepts.integration.retriever_adapter.ConceptGraphRetriever',
+                side_effect=_capture,
+            ),
+        ):
+            _run_doc_search(concept_graph_store=MagicMock(), k=25)
+
+        assert captured[0]['k'] == 25
+    finally:
+        CONCEPT_GRAPH_ENABLED.value = orig
+
+
 def test_concept_graph_embed_alpha_threads_through(hybrid_patches) -> None:
     orig = CONCEPT_GRAPH_ENABLED.value
     CONCEPT_GRAPH_ENABLED.value = True

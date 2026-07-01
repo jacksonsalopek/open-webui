@@ -25,6 +25,7 @@ from open_webui.retrieval.concepts.schema import (
     ConceptKind,
     DefinesProps,
     EdgeType,
+    IsNamedInProps,
     ReferencesProps,
     edge_with_props,
 )
@@ -408,3 +409,448 @@ def test_router_max_neighbors_override_threads_to_retriever() -> None:
         )
 
     assert configs[0].max_neighbors_per_seed == 400
+
+
+# ---- Wave 6: Zap-style intent classifier + find_symbol radius widening ----
+
+
+def test_classify_where_do_we_pick_is_find_symbol() -> None:
+    """A6: ``where do we <verb>`` questions are find_symbol-shaped."""
+    result = classify_intent(
+        'where do we pick the best compression setting for exports?',
+    )
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_do_we_implement_is_find_symbol() -> None:
+    """A6: ``where do we <verb>`` beats explain_region and generate_code."""
+    result = classify_intent(
+        'where do we set up the right-click handling?',
+    )
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_do_we_copy_is_find_symbol() -> None:
+    result = classify_intent(
+        "where do we copy the toolbar's result text to the clipboard?",
+    )
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_does_the_app_pick_is_find_symbol() -> None:
+    result = classify_intent(
+        'where does the app pick between PNG, JPEG, and WebP encoder options?',
+    )
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_do_we_decide_is_find_symbol() -> None:
+    result = classify_intent(
+        'where do we decide whether an LLM call goes to onnx-genai or llama-cpp?',
+    )
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_who_calls_still_where_used() -> None:
+    result = classify_intent(
+        'who calls the backup service before mutating an original image file?',
+    )
+    assert result.intent == Intent.WHERE_USED
+
+
+def test_classify_how_does_still_explain_region() -> None:
+    result = classify_intent(
+        'how does the app pick which image processor handles a given file?',
+    )
+    assert result.intent == Intent.EXPLAIN_REGION
+
+
+def test_classify_where_is_still_find_symbol() -> None:
+    result = classify_intent('where is the SVG image processor implemented?')
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_is_loaded_when_classifies_where_used() -> None:
+    result = classify_intent(
+        'where is the saved theme preference loaded when the app starts up?',
+    )
+    assert result.intent == Intent.WHERE_USED
+
+
+def test_classify_where_is_persisted_classifies_where_used() -> None:
+    result = classify_intent(
+        'where is the user setting persisted across sessions?',
+    )
+    assert result.intent == Intent.WHERE_USED
+
+
+def test_classify_where_is_defined_still_find_symbol() -> None:
+    result = classify_intent('where is ToolbarViewModel defined?')
+    assert result.intent == Intent.FIND_SYMBOL
+
+
+def test_classify_where_is_used_still_where_used() -> None:
+    result = classify_intent('where is ClipboardManager used?')
+    assert result.intent == Intent.WHERE_USED
+
+
+def test_route_find_symbol_radius_2_opt_in_reaches_2hop_neighbors() -> None:
+    """q01-style graph: seed ``svg`` IS_NAMED_IN the artifact; ``optimize`` is
+    DEFINES'd by the same artifact (2-hop via IS_NAMED_IN → DEFINES)."""
+    store = InMemoryGraphStore()
+    svg_id = _upsert(store, _concept('svg'))
+    optimize_id = _upsert(store, _concept('optimize'))
+    artifact_id = store.upsert_artifact(_artifact('/src/SvgProcessor.cs'))
+    store.upsert_edge(
+        edge_with_props(
+            src_id=svg_id,
+            dst_id=artifact_id,
+            props=IsNamedInProps(first_seen_at=_TS),
+        ),
+    )
+    store.upsert_edge(
+        edge_with_props(
+            src_id=artifact_id,
+            dst_id=optimize_id,
+            props=DefinesProps(count=1),
+        ),
+    )
+
+    result = route(
+        RetrievalQuery(text='where is the SVG image processor implemented?', top_k=10),
+        store,
+        config=RouterConfig(
+            decompose_unresolved_tokens=False,
+            find_symbol_radius=2,
+        ),
+    )
+
+    hit_names = {hit.concept.name for hit in result.hits}
+    assert 'optimize' in hit_names
+
+
+def test_route_find_symbol_radius_config_override() -> None:
+    store = InMemoryGraphStore()
+    _upsert(store, _concept('toolbar'))
+
+    configs: list[NeighborhoodRetrieverConfig] = []
+    original_init = NeighborhoodRetriever.__init__
+
+    def tracking_init(self, config=None):
+        configs.append(config or NeighborhoodRetrieverConfig())
+        original_init(self, config)
+
+    cfg = RouterConfig(find_symbol_radius=1)
+    with patch.object(NeighborhoodRetriever, '__init__', tracking_init):
+        route(
+            RetrievalQuery(text='where is Toolbar defined?', top_k=5),
+            store,
+            config=cfg,
+        )
+
+    assert configs[0].radius == 1
+
+
+# ---- Wave 6.6-A: find_symbol edge_types widening (CO_OCCURS_WITH opt-in) ----
+
+
+def test_route_find_symbol_default_edge_types_is_defines_and_is_named_in() -> None:
+    store = InMemoryGraphStore()
+    _upsert(store, _concept('toolbar'))
+
+    configs: list[NeighborhoodRetrieverConfig] = []
+    original_init = NeighborhoodRetriever.__init__
+
+    def tracking_init(self, config=None):
+        configs.append(config or NeighborhoodRetrieverConfig())
+        original_init(self, config)
+
+    with patch.object(NeighborhoodRetriever, '__init__', tracking_init):
+        route(
+            RetrievalQuery(text='where is Toolbar defined?', top_k=5),
+            store,
+            config=RouterConfig(),
+        )
+
+    assert configs[0].edge_types == (EdgeType.DEFINES, EdgeType.IS_NAMED_IN)
+
+
+def test_route_find_symbol_widened_edge_types_includes_co_occurs_with() -> None:
+    store = InMemoryGraphStore()
+    _upsert(store, _concept('svg'))
+
+    configs: list[NeighborhoodRetrieverConfig] = []
+    original_init = NeighborhoodRetriever.__init__
+
+    def tracking_init(self, config=None):
+        configs.append(config or NeighborhoodRetrieverConfig())
+        original_init(self, config)
+
+    widened = (
+        EdgeType.DEFINES,
+        EdgeType.IS_NAMED_IN,
+        EdgeType.CO_OCCURS_WITH,
+    )
+    with patch.object(NeighborhoodRetriever, '__init__', tracking_init):
+        route(
+            RetrievalQuery(text='where is SVG defined?', top_k=5),
+            store,
+            config=RouterConfig(find_symbol_edge_types=widened),
+        )
+
+    assert configs[0].edge_types == widened
+
+
+def test_route_find_symbol_widened_edge_types_reaches_co_defined_concepts() -> None:
+    """q01 fix: ``optimize`` co-occurs with ``svg`` but is not DEFINES/IS_NAMED_IN
+    linked to the same artifact — only reachable via CO_OCCURS_WITH."""
+    store = InMemoryGraphStore()
+    svg_id = _upsert(store, _concept('svg'))
+    optimize_id = _upsert(store, _concept('optimize'))
+    artifact_id = store.upsert_artifact(_artifact('/src/SvgProcessor.cs'))
+    store.upsert_edge(
+        edge_with_props(
+            src_id=artifact_id,
+            dst_id=svg_id,
+            props=DefinesProps(count=1),
+        ),
+    )
+    store.upsert_edge(
+        edge_with_props(
+            src_id=svg_id,
+            dst_id=optimize_id,
+            props=CoOccursWithProps(weight=1.0, chunk_count=1),
+        ),
+    )
+
+    widened = (
+        EdgeType.DEFINES,
+        EdgeType.IS_NAMED_IN,
+        EdgeType.CO_OCCURS_WITH,
+    )
+    result_widened = route(
+        RetrievalQuery(text='where is the SVG image processor implemented?', top_k=10),
+        store,
+        config=RouterConfig(
+            decompose_unresolved_tokens=False,
+            find_symbol_radius=2,
+            find_symbol_edge_types=widened,
+        ),
+    )
+    hit_names_widened = {hit.concept.name for hit in result_widened.hits}
+    assert 'optimize' in hit_names_widened
+
+    result_default = route(
+        RetrievalQuery(text='where is the SVG image processor implemented?', top_k=10),
+        store,
+        config=RouterConfig(
+            decompose_unresolved_tokens=False,
+            find_symbol_radius=2,
+        ),
+    )
+    hit_names_default = {hit.concept.name for hit in result_default.hits}
+    assert 'optimize' not in hit_names_default
+
+
+def test_route_find_symbol_edge_types_threads_to_retrieval_query() -> None:
+    store = InMemoryGraphStore()
+    _upsert(store, _concept('svg'))
+
+    queries: list[RetrievalQuery] = []
+    original_retrieve = NeighborhoodRetriever.retrieve
+
+    def tracking_retrieve(self, query, graph_store):
+        queries.append(query)
+        return original_retrieve(self, query, graph_store)
+
+    with patch.object(NeighborhoodRetriever, 'retrieve', tracking_retrieve):
+        route(
+            RetrievalQuery(text='where is SVG defined?', top_k=5),
+            store,
+            config=RouterConfig(),
+        )
+
+    assert queries[0].edge_types_filter == (
+        EdgeType.DEFINES,
+        EdgeType.IS_NAMED_IN,
+    )
+
+    queries.clear()
+    widened = (
+        EdgeType.DEFINES,
+        EdgeType.IS_NAMED_IN,
+        EdgeType.CO_OCCURS_WITH,
+    )
+    with patch.object(NeighborhoodRetriever, 'retrieve', tracking_retrieve):
+        route(
+            RetrievalQuery(text='where is SVG defined?', top_k=5),
+            store,
+            config=RouterConfig(find_symbol_edge_types=widened),
+        )
+
+    assert queries[0].edge_types_filter == widened
+
+
+# ---- Wave 6.8: query-side CODE-stopword relaxation (Lever A for q07) ----
+
+
+def test_extract_symbols_keeps_code_words_in_query() -> None:
+    """q07 regression guard: ``instance`` and ``args`` are CODE-class
+    stopwords but are the concept-bearing words the query literally
+    contains. With ``keep_code_symbols_as_seeds=True`` (default), they
+    must survive ``_extract_symbols`` and become candidate seeds."""
+    result = classify_intent('how does it ensure only one instance runs with args?')
+    extracted = set(result.extracted_symbols)
+    assert 'instance' in extracted
+    assert 'args' in extracted
+
+
+def test_extract_symbols_keeps_kwargs_when_flag_true() -> None:
+    """``kwargs`` and ``handler`` are CODE stopwords with len >= 4 — when
+    the flag is True they are kept alongside the non-stopword
+    ``dispatcher``."""
+    result = classify_intent(
+        'where does the dispatcher forward kwargs to the handler?',
+        config=RouterConfig(keep_code_symbols_as_seeds=True),
+    )
+    extracted = set(result.extracted_symbols)
+    assert 'kwargs' in extracted
+    assert 'dispatcher' in extracted
+    assert 'handler' in extracted
+
+
+def test_extract_symbols_drops_code_words_when_flag_false() -> None:
+    """Ablation path: with the flag False, CODE stopwords (``kwargs``,
+    ``handler``) are dropped even when they pass the identifier-shape
+    check — preserves W6.6 behavior. Non-stopword ``dispatcher`` is
+    still kept."""
+    result = classify_intent(
+        'where does the dispatcher forward kwargs to the handler?',
+        config=RouterConfig(keep_code_symbols_as_seeds=False),
+    )
+    extracted = set(result.extracted_symbols)
+    assert 'dispatcher' in extracted
+    assert 'kwargs' not in extracted
+    assert 'handler' not in extracted
+
+
+def test_extract_symbols_still_drops_english_stopwords() -> None:
+    """English stopwords (``the``, ``how``, ``does``, ``for``) are always
+    dropped regardless of the flag. Concept-bearing words (``manager``,
+    ``handle``, ``request``) are kept — ``manager`` is a CODE stopword
+    that the flag re-admits."""
+    result = classify_intent('how does the manager handle the request?')
+    extracted = set(result.extracted_symbols)
+    assert 'the' not in extracted
+    assert 'how' not in extracted
+    assert 'does' not in extracted
+    assert 'for' not in extracted
+    assert 'manager' in extracted
+    assert 'handle' in extracted
+    assert 'request' in extracted
+
+
+def test_extract_symbols_drops_short_code_stopwords() -> None:
+    """Short CODE stopwords (``get``/``set``, len <= 3) fail
+    ``_looks_like_identifier_token`` and are still dropped even with the
+    flag True — bounds the noise re-admission to identifier-shaped
+    tokens only."""
+    result = classify_intent('where do we get the value from set?')
+    extracted = set(result.extracted_symbols)
+    assert 'get' not in extracted
+    assert 'set' not in extracted
+
+
+def test_route_explain_region_q07_style_query_resolves_instance_seed() -> None:
+    """Integration seam: with the flag default True, the q07-style query
+    ``"how does Zap make sure only one instance runs?"`` resolves
+    ``instance`` as a seed, and the walk from ``instance`` reaches
+    ``mutex``/``single``/``named-pipe`` (co-defined in Program.cs) in
+    the top-10 hits."""
+    store = InMemoryGraphStore()
+    instance_id = _upsert(store, _concept('instance'))
+    mutex_id = _upsert(store, _concept('mutex'))
+    single_id = _upsert(store, _concept('single'))
+    _upsert(store, _concept('args'))
+    named_pipe_id = _upsert(
+        store,
+        _concept('named-pipe', kind=ConceptKind.PHRASE),
+    )
+
+    for neighbor_id in (mutex_id, single_id, named_pipe_id):
+        store.upsert_edge(
+            edge_with_props(
+                src_id=instance_id,
+                dst_id=neighbor_id,
+                props=CoOccursWithProps(weight=1.0, chunk_count=1),
+            ),
+        )
+
+    queries: list[RetrievalQuery] = []
+    original_retrieve = NeighborhoodRetriever.retrieve
+
+    def tracking_retrieve(self, query, graph_store):
+        queries.append(query)
+        return original_retrieve(self, query, graph_store)
+
+    with patch.object(NeighborhoodRetriever, 'retrieve', tracking_retrieve):
+        result = route(
+            RetrievalQuery(
+                text='how does Zap make sure only one instance runs?',
+                top_k=10,
+            ),
+            store,
+            config=RouterConfig(),
+        )
+
+    seeds = set(queries[0].seed_concept_ids or ())
+    assert instance_id in seeds
+
+    hit_names = {hit.concept.name for hit in result.hits if hit.concept}
+    assert 'mutex' in hit_names
+    assert 'single' in hit_names
+    assert 'named-pipe' in hit_names
+
+
+def test_route_explain_region_q07_query_with_flag_disabled_loses_instance_seed() -> None:
+    """Ablation: with ``keep_code_symbols_as_seeds=False``, ``instance``
+    is dropped by ``_extract_symbols`` and never reaches the seed set —
+    confirming the flag is the actual lever for q07 seed resolution."""
+    store = InMemoryGraphStore()
+    instance_id = _upsert(store, _concept('instance'))
+    mutex_id = _upsert(store, _concept('mutex'))
+    single_id = _upsert(store, _concept('single'))
+    _upsert(store, _concept('args'))
+    named_pipe_id = _upsert(
+        store,
+        _concept('named-pipe', kind=ConceptKind.PHRASE),
+    )
+
+    for neighbor_id in (mutex_id, single_id, named_pipe_id):
+        store.upsert_edge(
+            edge_with_props(
+                src_id=instance_id,
+                dst_id=neighbor_id,
+                props=CoOccursWithProps(weight=1.0, chunk_count=1),
+            ),
+        )
+
+    queries: list[RetrievalQuery] = []
+    original_retrieve = NeighborhoodRetriever.retrieve
+
+    def tracking_retrieve(self, query, graph_store):
+        queries.append(query)
+        return original_retrieve(self, query, graph_store)
+
+    with patch.object(NeighborhoodRetriever, 'retrieve', tracking_retrieve):
+        route(
+            RetrievalQuery(
+                text='how does Zap make sure only one instance runs?',
+                top_k=10,
+            ),
+            store,
+            config=RouterConfig(keep_code_symbols_as_seeds=False),
+        )
+
+    seeds = set(queries[0].seed_concept_ids or ())
+    assert instance_id not in seeds

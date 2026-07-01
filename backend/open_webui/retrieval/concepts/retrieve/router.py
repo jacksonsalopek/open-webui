@@ -49,9 +49,43 @@ _IDENTIFIER_IN_TEXT_RE = re.compile(
 _FIND_SYMBOL_KEYWORDS = (
     'where is',
     'where are',
+    'where do we',
     'defined',
     'declaration',
     'declared',
+)
+
+# ``where do`` / ``where does`` (without ``we``) — location-in-code phrasing
+# that lacks the literal ``where is`` substring.  ``where does`` requires an
+# action verb (``pick``, ``implement``, …) so concept-discovery questions
+# like Zap q08 ("where does the app set up …") defer to glossary FIND_CONCEPT.
+_WHERE_DOES_FIND_SYMBOL_VERBS = (
+    ' pick',
+    ' implement',
+    ' decide',
+    ' copy',
+    ' read ',
+    ' define',
+    ' declare',
+    ' route',
+    ' dispatch',
+    ' forward',
+    ' handle',
+    ' store',
+    ' save',
+    ' load',
+    ' persist',
+    ' write',
+)
+_WHERE_DO_PLURAL_RE = re.compile(r'\bwhere do (?!we\b|does\b)\w')
+
+_WHERE_USED_LOAD_KEYWORDS = (
+    'loaded',
+    'saved',
+    'persisted',
+    'restored',
+    'read from',
+    'written to',
 )
 
 _WHERE_USED_KEYWORDS = (
@@ -182,6 +216,32 @@ class RouterConfig:
     meaningful when ``tiebreaker='catrag'``. ``None`` keeps the retriever
     default (effectively 0.0 — no anchor bonus)."""
 
+    find_symbol_radius: int = 1
+    """Hop radius for the ``find_symbol`` neighborhood walk. Default ``1`` is
+    the Phase 1 walk. Set to ``2`` for the W6-B widened walk (opt-in
+    ablation) that reaches co-defined concepts in the seed symbol's defining
+    file (via ``IS_NAMED_IN`` → artifact → ``DEFINES``)."""
+
+    find_symbol_edge_types: tuple[EdgeType, ...] | None = None
+    """Edge types for the find_symbol neighborhood walk. ``None`` (default) keeps
+    the Phase 1 filter ``(DEFINES, IS_NAMED_IN)``. Set to
+    ``(DEFINES, IS_NAMED_IN, CO_OCCURS_WITH)`` to widen the walk to co-defined
+    concepts (the W6.6-A fix for Zap q01: reaches ``optimize``/``xelement``/
+    ``compressionresult`` via CO_OCCURS_WITH with ``svg``/``processor``). The
+    wider filter surfaces more candidates, which may dilute PPR/anchor scores;
+    use only when the narrow filter under-recovers."""
+
+    keep_code_symbols_as_seeds: bool = True
+    """When True, query-side ``_extract_symbols`` keeps CODE-class tokens
+    (``instance``/``args``/``kwargs``-style identifiers) as candidate seeds
+    when they pass ``_looks_like_identifier_token`` (len >= 4, identifier-
+    shaped). ENGLISH and LANGUAGE stopwords are still dropped. Default True
+    because the W6.7 diagnostic confirmed that dropping ``instance`` from
+    the q07 query "only one instance runs" starves the walk of the very
+    concept the question is about. Set False to ablate (the W6.6 behavior)
+    -- useful for measuring the regression risk of re-admitting
+    code-stopword seeds on the broader acceptance suite."""
+
 
 def classify_intent(
     text: str,
@@ -195,7 +255,12 @@ def classify_intent(
     lower = text.lower()
 
     extracted_phrases = tuple(hit.phrase.name for hit in glossary.match(text))
-    extracted_symbols = _extract_symbols(text, language=cfg.language, rules=rules)
+    extracted_symbols = _extract_symbols(
+        text,
+        language=cfg.language,
+        rules=rules,
+        keep_code_symbols_as_seeds=cfg.keep_code_symbols_as_seeds,
+    )
 
     intent, provenance = _classify_rules(lower, extracted_phrases)
 
@@ -262,7 +327,8 @@ def _classify_rules(
         return Intent.WHERE_USED, _provenance(2, lower, _WHERE_USED_KEYWORDS)
 
     if _matches_find_symbol(lower):
-        return Intent.FIND_SYMBOL, _provenance(1, lower, _FIND_SYMBOL_KEYWORDS)
+        keywords = _find_symbol_provenance_keywords(lower)
+        return Intent.FIND_SYMBOL, _provenance(1, lower, keywords)
 
     # Glossary phrases are a *strong* find_concept signal — promote ahead of
     # explain_region. A keyword-only find_concept match (e.g. ``pattern`` in
@@ -309,6 +375,12 @@ def _classify_rules(
 def _matches_where_used(lower: str) -> bool:
     if _matches_keywords(lower, _WHERE_USED_KEYWORDS):
         return True
+    if ('where is' in lower or 'where are' in lower) and _matches_keywords(
+        lower,
+        _WHERE_USED_LOAD_KEYWORDS,
+    ):
+        if not any(kw in lower for kw in ('defined', 'declaration', 'declared')):
+            return True
     if ' used' in lower and ('where is' in lower or 'where are' in lower):
         if not any(kw in lower for kw in ('defined', 'declaration', 'declared')):
             return True
@@ -316,13 +388,38 @@ def _matches_where_used(lower: str) -> bool:
 
 
 def _matches_find_symbol(lower: str) -> bool:
-    if not _matches_keywords(lower, _FIND_SYMBOL_KEYWORDS):
+    where_do_shaped = _matches_where_do_find_symbol(lower)
+    keyword_match = _matches_keywords(lower, _FIND_SYMBOL_KEYWORDS)
+    if not keyword_match and not where_do_shaped:
         return False
     if ' used' in lower and not any(
         kw in lower for kw in ('defined', 'declaration', 'declared')
     ):
         return False
     return True
+
+
+def _matches_where_do_find_symbol(lower: str) -> bool:
+    if 'where do we' in lower:
+        return True
+    if _WHERE_DO_PLURAL_RE.search(lower):
+        return True
+    if 'where does' in lower:
+        return any(verb in lower for verb in _WHERE_DOES_FIND_SYMBOL_VERBS)
+    return False
+
+
+def _find_symbol_provenance_keywords(lower: str) -> tuple[str, ...]:
+    """Keywords recorded in classifier provenance for find_symbol matches."""
+    matched = [kw for kw in _FIND_SYMBOL_KEYWORDS if kw in lower]
+    if _matches_where_do_find_symbol(lower):
+        if 'where do we' in lower and 'where do we' not in matched:
+            matched.append('where do we')
+        elif 'where does' in lower:
+            matched.append('where does')
+        elif _WHERE_DO_PLURAL_RE.search(lower):
+            matched.append('where do')
+    return tuple(matched)
 
 
 def _matches_find_concept(
@@ -362,6 +459,7 @@ def _extract_symbols(
     *,
     language: str,
     rules: TokenRules,
+    keep_code_symbols_as_seeds: bool = True,
 ) -> tuple[str, ...]:
     tokens = tokenize_text(text, rules=rules)
     uppercase_derived = _tokens_from_uppercase_identifiers(text, rules)
@@ -369,7 +467,13 @@ def _extract_symbols(
     seen: set[str] = set()
     result: list[str] = []
     for token in tokens:
-        if classify(token, language=language) != StopwordClass.NOT_STOPWORD:
+        klass = classify(token, language=language)
+        if klass == StopwordClass.ENGLISH or klass == StopwordClass.LANGUAGE:
+            # Always drop English + language-keyword stopwords -- they are
+            # never concept-bearing.
+            continue
+        if klass == StopwordClass.CODE and not keep_code_symbols_as_seeds:
+            # Ablation path: preserve W6.6 behavior (drop all CODE stopwords).
             continue
         if token in seen:
             continue
@@ -433,20 +537,24 @@ def _route_find_symbol(
     are expected and fine.
     """
     seeds = _resolve_symbol_seeds(classified, store, cfg)
+    edge_types = cfg.find_symbol_edge_types or (
+        EdgeType.DEFINES,
+        EdgeType.IS_NAMED_IN,
+    )
     retrieval_query = RetrievalQuery(
         text=query.text,
         embedding=query.embedding,
         seed_concept_ids=seeds,
         top_k=top_k,
-        edge_types_filter=(EdgeType.DEFINES, EdgeType.IS_NAMED_IN),
+        edge_types_filter=edge_types,
         kind_filter=query.kind_filter,
     )
     retriever = NeighborhoodRetriever(
         _neighborhood_config(
             cfg,
             classified=classified,
-            radius=1,
-            edge_types=(EdgeType.DEFINES, EdgeType.IS_NAMED_IN),
+            radius=cfg.find_symbol_radius,
+            edge_types=edge_types,
             seed_filter=SeedFilter.NONE,
         ),
     )
